@@ -25,8 +25,4 @@ Debug switches (environment variables):
     ARM2X86_SHOT=N,out.png   save the framebuffer after N frames, then exit
     ARM2X86_FAKE_KEY=k,a     inject one key event (test hook)
 
-Not yet: loading the app's own dylibs, the real libSystem/dyld cache, threads (pthread),
-static constructors (__mod_init_func), TLS, C++ exceptions, ObjC/Swift runtime,
-Foundation/AppKit/Metal. Anything unimplemented prints
-"unimplemented import _name called" and exits 127 - add it to hle.py / gfx.py / libcxx.py.
-Unicorn runs the guest CPU code in software, so CPU-heavy games will be slow; GL work is native.
+Not yet: loading apps that use advanced APIs
