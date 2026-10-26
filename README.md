@@ -3,7 +3,7 @@
     pip3 install unicorn glfw
     pip3 install capstone
     pip3 install pysdl3 && python3 gen_sdl3sigs.py
-    python3 loader.py path/to/arm64-binary [args...]
+    python3 loader.py --kern26 path/to/arm64-binary [args...]
     python3 run_tests.py            # on Linux: xvfb-run -a python3 run_tests.py
 
 What works: thin/fat Mach-O (arm64 and arm64e slices), classic rebase/bind opcodes,
