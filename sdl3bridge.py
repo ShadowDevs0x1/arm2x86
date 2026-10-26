@@ -90,12 +90,85 @@ def tex_h(e, raw, ti=0):
     ht = S.g2h.get(raw[ti], raw[ti]); return ctypes.c_int.from_address(ht + 8).value if ht else 0
 def rect_h(e, raw, ri, ti=0):
     return struct.unpack("<i", gread(e, raw[ri] + 12, 4))[0] if raw[ri] else tex_h(e, raw, ti)
-BUF = {   # name -> (arg index of the byte buffer, size fn(e, raw))
-    "SDL_PutAudioStreamData": (1, lambda e, a: a[2]),
-    "SDL_UpdateTexture": (2, lambda e, a: a[3] * rect_h(e, a, 1)),
-    "SDL_IOFromMem": (0, lambda e, a: a[1]), "SDL_IOFromConstMem": (0, lambda e, a: a[1]),
-    "SDL_ConvertAudioSamples": (2, lambda e, a: a[3]),
+BUF = {   # name -> (ptr index or tuple, size fn(e, raw), index of the length arg to shrink, or None)
+    "SDL_PutAudioStreamData": (1, lambda e, a: a[2], 2),
+    "SDL_GetAudioStreamData": (1, lambda e, a: a[2], 2),
+    "SDL_ReadIO": (1, lambda e, a: a[2], 2),
+    "SDL_WriteIO": (1, lambda e, a: a[2], 2),
+    "SDL_ReadStorageFile": (2, lambda e, a: a[3], 3),
+    "SDL_WriteStorageFile": (2, lambda e, a: a[3], 3),
+    "SDL_SaveFile": (1, lambda e, a: a[2], 2),
+    "SDL_SaveFile_IO": (1, lambda e, a: a[2], 2),
+    "SDL_ReadAsyncIO": (1, lambda e, a: a[3], 3),   # (io, ptr, offset, size, ...): shrink size, never the offset
+    "SDL_WriteAsyncIO": (1, lambda e, a: a[3], 3),
+    "SDL_MixAudio": ((0, 1), lambda e, a: a[3], 3), # dst, src, format, len, volume — both buffers are `len` bytes
+    "SDL_ConvertAudioSamples": (1, lambda e, a: a[2], 2),  # src data is arg 1, src_len is arg 2 (NOT arg 3)
+    "SDL_IOFromMem": (0, lambda e, a: a[1], 1),
+    "SDL_IOFromConstMem": (0, lambda e, a: a[1], 1),
+    "SDL_memcpy": ((0, 1), lambda e, a: a[2], 2),
+    "SDL_memmove": ((0, 1), lambda e, a: a[2], 2),
+    "SDL_memset": (0, lambda e, a: a[2], 2),
+    "SDL_UpdateTexture": (2, lambda e, a: a[3] * rect_h(e, a, 1), None),  # pitch * rows; no single length to shrink
 }
+_MAX_BUF = 64 << 20
+def _uclamp(n):
+    """Byte count from a guest integer. Reject negatives and sign-extended junk."""
+    n = int(n or 0) & M64
+    if n >= (1 << 63): return 0
+    return n
+def _span(e, v):
+    v = int(v or 0) & M64
+    for b, en in objc.regions(e):
+        if b <= v <= en: return max(0, min(en - v + 1, _MAX_BUF))
+    return 0
+def _note_bounce(name, n, asked):
+    if n != asked:
+        _say(f"[sdl] {name}: clamped buffer {asked} -> {n} bytes so libSDL3 cannot write past it")
+    elif os.environ.get("ARM2X86_VERBOSE") and n >= (1 << 20):
+        _say(f"[sdl] {name}: bouncing {n} byte buffer")
+def prepare_buffers(e, name, argks, raw):
+    """{arg index: bounce size}. Shrinks the length argument to the guest mapping (max 64MB).
+    Returns None when the call must be skipped (SDL would write past the mapping and there is no length to shrink)."""
+    spec = BUF.get(name)
+    if spec:
+        idxs, sfn = spec[0], spec[1]
+        if isinstance(idxs, int): idxs = (idxs,)
+        size_i = spec[2] if len(spec) > 2 else None
+        try: asked = _uclamp(sfn(e, raw))
+        except Exception: asked = 0
+        spans = []
+        for i in idxs:
+            v = raw[i] if i < len(raw) else 0
+            if v and is_guest(e, v): spans.append(_span(e, v))
+        if not spans: return {}
+        n = min(asked, min(spans), _MAX_BUF)
+        if size_i is None and asked > n: return None
+        if size_i is not None and size_i < len(raw): raw[size_i] = n & M64
+        _note_bounce(name, n, asked)
+        return {i: n for i in idxs if i < len(raw) and raw[i] and is_guest(e, raw[i])}
+    # Not in the table: a void* / Uint8* followed by exactly one integer is (ptr, bytecount).
+    # Do not guess when two integers follow (offset+size, or width+height) — those are listed above.
+    if any(a[0] == "cb" for a in argks): return {}
+    out = {}; i = 0
+    while i < len(argks):
+        k, v = argks[i], raw[i]
+        bytebuf = k[0] == "v" or (k[0] == "p" and k[1] == 1)
+        nxt = argks[i + 1] if i + 1 < len(argks) else None
+        after = argks[i + 2] if i + 2 < len(argks) else None
+        one_int = nxt and nxt[0] in "iu" and nxt[1] >= 4 and not (after and after[0] in "iu" and after[1] >= 4)
+        if bytebuf and v and is_guest(e, v) and one_int:
+            asked = _uclamp(raw[i + 1]); n = min(asked, _span(e, v), _MAX_BUF)
+            raw[i + 1] = n & M64; out[i] = n; _note_bounce(name, n, asked); i += 2; continue
+        i += 1
+    return out
+def _bounce_buf(e, name, v, n, hold, copyback):
+    """Host copy of n guest bytes. IOFrom* / NoCopy keep it (SDL reads it later); everything else is copied back."""
+    try: blob = gread(e, v, n) if n else b""
+    except Exception as ex: return None, str(ex)
+    b = ctypes.create_string_buffer(blob, max(n, 1)); hold.append(b)
+    if name.startswith("SDL_IOFrom") or "NoCopy" in name: S.keep.append(b)
+    else: copyback.append((v, b, n))
+    return ctypes.addressof(b), None
 COUNTED = {                                    # POINTER(T) arg i is an array whose length is arg j
     "SDL_RenderFillRects": (1, 2), "SDL_RenderRects": (1, 2), "SDL_RenderPoints": (1, 2), "SDL_RenderLines": (1, 2),
     "SDL_RenderGeometry": (2, 3), "SDL_FillSurfaceRects": (2, 3),
@@ -172,18 +245,34 @@ def call(e, name):
         raw.append(rd.read(_ENC[(k[0], k[1])]) if (k[0], k[1]) in _ENC else rd.read("Q"))
     surf_touched = [v for v in raw if v in S.surfaces]
     if surf_touched: surfaces_to_host(e, surf_touched)
+    sized = prepare_buffers(e, name, argks, raw)
+    if sized is None:
+        _say(f"[sdl] {name}: buffer is larger than the guest mapping and the length cannot be shrunk; call skipped")
+        e.uc.reg_write(UC_ARM64_REG_X0, 0); return None
     conv, copyback, hold = [], [], []
-    buf = BUF.get(name); cnt = COUNTED.get(name)
+    cnt = COUNTED.get(name)
     for i, (k, v) in enumerate(zip(argks, raw)):      # 2) translate each arg
         kk = k[0]
         if kk == "s":
             v = None if v == 0 else ctypes.create_string_buffer(gstr(e, v)); hold.append(v); conv.append(ctypes.addressof(v) if v is not None else None)
         elif kk == "p":
+            if v == 0: conv.append(None); continue
+            if v in S.g2h: conv.append(S.g2h[v]); continue
+            if i in sized and is_guest(e, v):
+                addr, err = _bounce_buf(e, name, v, sized[i], hold, copyback)
+                if err:
+                    _say(f"[sdl] {name}: cannot read {sized[i]} bytes at {v:#x} ({err}); call skipped")
+                    e.uc.reg_write(UC_ARM64_REG_X0, 0); return None
+                conv.append(addr); continue
+            if is_guest(e, v) and k[1] == 1:
+                # Uint8* whose length is not in the table. A 1-byte copy is a lie: SDL reads/writes the real
+                # length and SIGBUS. The guest mapping is this process's memory — hand that pointer over.
+                if not host_readable(v):
+                    _say(f"[sdl] {name}: byte pointer {i} = {v:#x} is not host-readable; call skipped")
+                    e.uc.reg_write(UC_ARM64_REG_X0, 0); return None
+                conv.append(v); continue
             n = k[1] * (raw[cnt[1]] if cnt and cnt[0] == i else 1)
-            if buf and buf[0] == i: n = buf[1](e, raw)
-            if v == 0: conv.append(None)
-            elif v in S.g2h: conv.append(S.g2h[v])
-            elif is_guest(e, v):
+            if is_guest(e, v):
                 b = ctypes.create_string_buffer(gread(e, v, n), max(n, 1)); hold.append(b); copyback.append((v, b, n)); conv.append(ctypes.addressof(b))
             else:
                 if v and not host_readable(v):
@@ -196,25 +285,37 @@ def call(e, name):
                 b = ctypes.create_string_buffer(gread(e, v, n), max(n, 8)); hold.append(b); copyback.append((v, b, n)); conv.append(ctypes.addressof(b))
             else: conv.append(v or None)
         elif kk == "v":
-            if buf and buf[0] == i and v and is_guest(e, v):
-                n = buf[1](e, raw); b = ctypes.create_string_buffer(gread(e, v, n), max(n, 1))
-                if name.startswith("SDL_IOFrom"): S.keep.append(b)        # SDL keeps reading it later
-                hold.append(b); conv.append(ctypes.addressof(b))
-            elif (v and v not in S.g2h and is_guest(e, v) and not any(a[0] == "cb" for a in argks)
-                  and not name.startswith(OPAQUE_V) and "Property" not in name):
-                n = region_room(e, v)                       # a data buffer the table doesn't know: bounce it in and out
-                b = ctypes.create_string_buffer(gread(e, v, n), n); hold.append(b); copyback.append((v, b, n)); conv.append(ctypes.addressof(b))
-            else:
-                if v and v not in S.g2h and not is_guest(e, v) and not host_readable(v):
+            if v == 0: conv.append(None); continue
+            if v in S.g2h: conv.append(S.g2h[v]); continue
+            if i in sized and is_guest(e, v):
+                addr, err = _bounce_buf(e, name, v, sized[i], hold, copyback)
+                if err:
+                    _say(f"[sdl] {name}: cannot read {sized[i]} bytes at {v:#x} ({err}); call skipped")
+                    e.uc.reg_write(UC_ARM64_REG_X0, 0); return None
+                conv.append(addr); continue
+            if (is_guest(e, v) and not any(a[0] == "cb" for a in argks)
+                    and not name.startswith(OPAQUE_V) and "Property" not in name):
+                # Length unknown. Do NOT bounce region_room (256KB): SDL still writes the real size and the
+                # host dies with SIGBUS inside f(*conv), which Python cannot catch. Unicorn identity-maps, so
+                # the guest address IS the buffer.
+                if not host_readable(v):
                     _say(f"[sdl] {name}: argument {i} = {v:#x} is neither guest nor host memory; call skipped (would crash the host)")
                     e.uc.reg_write(UC_ARM64_REG_X0, 0); return None
-                conv.append(h(e, v) if v else None)
+                conv.append(v); continue
+            if not is_guest(e, v) and not host_readable(v):
+                _say(f"[sdl] {name}: argument {i} = {v:#x} is neither guest nor host memory; call skipped (would crash the host)")
+                e.uc.reg_write(UC_ARM64_REG_X0, 0); return None
+            conv.append(h(e, v))
         elif kk == "cb": conv.append(make_cb(e, v, k[2]) if v else None)
         else: conv.append(v)
     f = getattr(lib, name); f.argtypes = [ctype(k) for k in argks]
     f.restype = None if ret[0] == "0" else ctype(ret) if ret[0] in "iufd" else c_void_p
     if name == "SDL_UnlockTexture" and raw[0] in S.locks:           # push the guest's texture pixels to the host
         hp, gp, nb = S.locks.pop(raw[0]); ctypes.memmove(hp, gread(e, gp, nb), nb)
+    for i, (k, c) in enumerate(zip(argks, conv)):     # last line: a raw int pointer libSDL3 cannot read is a SIGBUS
+        if k[0] in ("v", "p", "pp", "s") and isinstance(c, int) and c and not host_readable(c):
+            _say(f"[sdl] {name}: pointer arg {i} = {c:#x} is not readable in this process; call skipped")
+            e.uc.reg_write(UC_ARM64_REG_X0, 0); return None
     if TRACE: _say(f"[sdl] > {name}({', '.join(hex(x) if isinstance(x, int) else str(x) for x in raw)})")
     r = f(*conv)
     if TRACE:
@@ -242,6 +343,15 @@ def call(e, name):
                 n = (struct.unpack("<i", gread(e, raw[0], 4))[0] if raw[0] else 0) + 1; out = mirror(e, out, 4 * n)
             elif name in SURFACE_RET: out = surface_mirror(e, out)
             elif name in TEXTURE_RET: out = mirror(e, out, 16)
+            elif name in ("SDL_LoadFile", "SDL_LoadFile_IO"):
+                # SDL malloc'd the bytes. A raw host pointer is not guest memory: mirror it (SDL_free still works via g2h).
+                n = 0
+                try:
+                    if len(raw) > 1 and raw[1]: n = _uclamp(struct.unpack("<Q", gread(e, raw[1], 8))[0])
+                except Exception: n = 0
+                if n > _MAX_BUF:
+                    _say(f"[sdl] {name}: file is {n} bytes; mirroring the first {_MAX_BUF}"); n = _MAX_BUF
+                out = mirror(e, out, n)
             elif name == "SDL_GetKeyboardState": out = mirror(e, out, 512, live=True)
             elif name == "SDL_GlobDirectory":                      # char** (NULL terminated) -> guest array of guest strings
                 items = []

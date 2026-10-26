@@ -567,6 +567,8 @@ def _guest_obj_arg(e, v, selname):
     if v in _SYMSTR:                                   # placeholder for e.g. NSFontTextStyleLargeTitle: use the host's real constant
         real = _host_symbol_object(_SYMSTR[v])
         if real: return real
+    prox = HOST_PROXY.get(v) or HOST_PROXY.get(int(v) & M64)
+    if prox: return prox          # host stand-in (NSWindowController, ...). nil here makes AppKit message the wrong object.
     if read_isa_is_cf(e, v): return to_nsstring(e, v)
     nm = stub_symbol(e, v)
     if nm is not None:
@@ -588,6 +590,24 @@ def _nil_key(selname, arg_ts, conv):
     if not selname.endswith(_KEYED_LAST): return False
     objs = [i for i, t in enumerate(arg_ts) if t == "@"]
     return bool(objs) and conv[objs[-1]] in (0, None)
+def _clear_sheet_sel(selname, arg_ts, conv):
+    """beginSheetModalForWindow:modalDelegate:didEndSelector:contextInfo: with a delegate that does not implement
+    the selector makes AppKit send that selector to the NSAlert itself, which aborts the process (NSException is not
+    a Python exception). A nil selector is the documented way to skip the callback."""
+    if selname != "beginSheetModalForWindow:modalDelegate:didEndSelector:contextInfo:": return
+    try: si = arg_ts.index(":")
+    except ValueError: return
+    di = si - 1
+    delegate = conv[di] if 0 <= di < len(conv) else 0
+    sel = conv[si] if si < len(conv) else 0
+    ok = False
+    if delegate and sel:
+        try: ok = bool(hmsg(delegate, "respondsToSelector:", sel, argtypes=[c_void_p], restype=ctypes.c_uint8))
+        except Exception: ok = False
+    if not ok and si < len(conv) and conv[si]:
+        _warn_arg(f"[objc] -[{selname}] delegate {int(delegate or 0):#x} does not implement the didEnd selector; "
+                  f"clearing it so AppKit cannot abort")
+        conv[si] = 0
 
 # ---- weak references (arm2x86 had no emulation: the guest's weak ivars/delegates silently became nil) --------------------
 @fn("objc_storeWeak", "objc_storeWeakOrNil")
@@ -831,6 +851,7 @@ def msg_send(e, super_call=False):
     if _nil_key(selname, arg_ts, conv):
         _warn_arg(f"[objc] -[{selname}] called with a nil key (unresolved/guest key): returning nil without calling the host")
         write_ret(e, ret_t, 0); return
+    _clear_sheet_sel(selname, arg_ts, conv)
     if selname in SYNC_BEFORE: sync_to_host()
     # Cache CFUNCTYPE by layout so Structure class identity stays stable across calls.
     fkey = (_struct_key(ret_t), tuple(_struct_key(t) for t in arg_ts))
@@ -919,28 +940,44 @@ def _kvc_set(s, c, v, k):
 def _kvc_get(s, c, k): return None
 def _action_cb(s, cmd, sender):
     """A control in the host nib sent its action to the proxy: run the guest controller's method of that name."""
+    _queue_guest_action(s, cmd, [sender or 0])
+def _action_cb2(s, cmd, a1, a2):
+    _queue_guest_action(s, cmd, [a1 or 0, a2 or 0])
+def _action_cb3(s, cmd, a1, a2, a3):
+    """Sheet didEnd and other 3-arg selectors. a2 is often an NSInteger (return code); it fits one register."""
+    _queue_guest_action(s, cmd, [a1 or 0, int(a2 or 0) & M64, a3 or 0])
+def _queue_guest_action(s, cmd, extras):
     try:
         gs = _PROXY_REV.get(s); e = ST.emu
         name = host()["objc"].sel_getName(cmd).decode()
         cls = CLASSES.get(_u64(e, gs)); imp = lookup(cls, name, False) if cls else None
         if imp:
             sys.stderr.write(f"[objc] action {name} -> guest -[{cls['name']} {name}] queued\n")
-            with _LOCK: PENDING.append((imp, [gs, sel_guest(e, name), sender or 0]))
+            with _LOCK: PENDING.append((imp, [gs, sel_guest(e, name), *extras]))
         else: sys.stderr.write(f"[objc] action {name} has no guest implementation\n")
     except Exception as ex: sys.stderr.write(f"[objc] action bridge failed: {ex}\n")
 _ACT = {}
 def bridge_actions(e, wc, guest_self):
-    """Make the host proxy answer every one-argument selector the guest controller implements (button actions, delegates)."""
+    """Make the host proxy answer guest selectors the nib/AppKit will send (actions AND sheet didEnd callbacks)."""
     o = host()["objc"]; cls = _wc_class(o)
     if "cb" not in _ACT:
-        _ACT["cb"] = ctypes.CFUNCTYPE(None, c_void_p, c_void_p, c_void_p)(_action_cb); _KEEP.append(_ACT["cb"]); _ACT["done"] = set()
+        _ACT["cb"] = ctypes.CFUNCTYPE(None, c_void_p, c_void_p, c_void_p)(_action_cb)
+        _ACT["cb2"] = ctypes.CFUNCTYPE(None, c_void_p, c_void_p, c_void_p, c_void_p)(_action_cb2)
+        _ACT["cb3"] = ctypes.CFUNCTYPE(None, c_void_p, c_void_p, c_void_p, c_void_p, c_void_p)(_action_cb3)
+        _ACT["cb3rc"] = ctypes.CFUNCTYPE(None, c_void_p, c_void_p, c_void_p, ctypes.c_longlong, c_void_p)(_action_cb3)
+        _KEEP.extend(_ACT[k] for k in ("cb", "cb2", "cb3", "cb3rc")); _ACT["done"] = set()
     g = CLASSES.get(_u64(e, guest_self)); n = 0
     while g:
         for name in g["methods"]:
-            if name.count(":") != 1 or not name.endswith(":") or name in _ACT["done"]: continue
+            ncols = name.count(":")
+            if ncols not in (1, 2, 3) or not name.endswith(":") or name in _ACT["done"]: continue
             _ACT["done"].add(name)
             if o.class_getInstanceMethod(cls, o.sel_registerName(name.encode())): continue   # the host already implements it
-            if o.class_addMethod(cls, o.sel_registerName(name.encode()), ctypes.cast(_ACT["cb"], c_void_p), b"v@:@"): n += 1
+            if ncols == 1: cb, enc = _ACT["cb"], b"v@:@"
+            elif ncols == 2: cb, enc = _ACT["cb2"], b"v@:@@"
+            elif "returnCode:" in name: cb, enc = _ACT["cb3rc"], b"v@:@q^v"   # (id, NSInteger, void*) — the license sheet
+            else: cb, enc = _ACT["cb3"], b"v@:@@@"
+            if o.class_addMethod(cls, o.sel_registerName(name.encode()), ctypes.cast(cb, c_void_p), enc): n += 1
         g = CLASSES.get(g["super"])
     if n: sys.stderr.write(f"[objc] bridged {n} guest action/delegate selector(s) onto the host window controller\n")
 def _wc_class(o):
