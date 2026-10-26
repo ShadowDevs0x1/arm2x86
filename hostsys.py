@@ -9,6 +9,7 @@ Guest open/mmap flags are Darwin's. errno values written back are Darwin's.
 """
 import os, sys, time, struct, ctypes, errno, random, select, socket, mmap as _mmap
 from hle import fn, FUNCS, DATA, M64, s32, s64, FILE_BASE, fd_of, set_errno
+import spoof
 
 PAGE = 0x4000
 DATA["_vm_page_size"] = PAGE
@@ -86,7 +87,7 @@ def _stat_into(e, st, p):
 
 @fn("open")
 def _open(e):
-    path, flags = e.cstr(e.arg(0)), e.arg(1)
+    path, flags = spoof.map_path(e.cstr(e.arg(0))), e.arg(1)
     mode = e.arg(2) & 0o777 or 0o666
     try: return os.open(path, _oflags(flags), mode)
     except OSError as ex: return _fail(e, _derr(ex))
@@ -94,7 +95,7 @@ def _open(e):
 def _openat(e):
     # ignore dirfd unless it's AT_FDCWD (-2)
     e.uc  # silence
-    path = e.cstr(e.arg(1))
+    path = spoof.map_path(e.cstr(e.arg(1)))
     try: return os.open(path, _oflags(e.arg(2)), e.arg(3) & 0o777 or 0o666)
     except OSError as ex: return _fail(e, _derr(ex))
 @fn("close")
@@ -251,7 +252,7 @@ def _mode_to_o(mode):
     return f
 @fn("fopen")
 def _fopen(e):
-    try: return _file(e, e.cstr(e.arg(0)), e.cstr(e.arg(1)))
+    try: return _file(e, spoof.map_path(e.cstr(e.arg(0))), e.cstr(e.arg(1)))
     except OSError as ex: set_errno(e, _derr(ex)); return 0
 @fn("fdopen")
 def _fdopen(e): return FILE_BASE + (e.arg(0) & 0xffff)
@@ -452,6 +453,8 @@ def _strftime(e):
 
 # ------------------------------------------------------------------- sysctl
 def _sysctl_value(name):
+    _ov = spoof.sysctl_override(name)
+    if _ov is not None: return _ov
     table = {
         "hw.machine": b"arm64",
         "hw.model": b"arm64",
@@ -488,10 +491,7 @@ def _sysctl_value(name):
     if name == "kern.hostname": return socket.gethostname()
     return None
 
-@fn("sysctlbyname")
-def _scbn(e):
-    name = e.cstr(e.arg(0))
-    oldp, oldlenp = e.arg(1), e.arg(2)
+def _sysctl_core(e, name, oldp, oldlenp):
     val = _sysctl_value(name)
     if val is None: return _fail(e, ENOENT, 0xffffffff)
     if isinstance(val, int) and not isinstance(val, bool):
@@ -511,31 +511,16 @@ def _scbn(e):
             e.write(oldp, raw[:have]); return _fail(e, ENOMEM, 0xffffffff)
         e.write(oldp, raw)
     return 0
+@fn("sysctlbyname")
+def _scbn(e): return _sysctl_core(e, e.cstr(e.arg(0)), e.arg(1), e.arg(2))
 @fn("sysctl")
-def _sysctl(e):
-    # mib is int[] — only hw.ncpu style is common; report memsize for hw.*
-    mib0 = s32(int.from_bytes(e.read(e.arg(0), 4), "little")) if e.arg(0) else 0
-    # CTL_HW = 6
-    if mib0 == 6 and e.arg(1) >= 2:
-        mib1 = s32(int.from_bytes(e.read(e.arg(0) + 4, 4), "little"))
-        name = {1: "hw.machine", 7: "hw.ncpu", 24: "hw.memsize", 10: "hw.model"}.get(mib1, "hw.ncpu")
-        # rewrite as sysctlbyname by planting the name
-        # fall through using the same writer
-        fake = e.alloc_cstr(name)
-        # temporarily call with name pointer: we just inline
-        saved = e.uc.reg_read
-        # simpler: duplicate the body via _sysctl_value
-        val = _sysctl_value(name)
-        oldp, oldlenp = e.arg(2), e.arg(3)
-        if isinstance(val, int):
-            raw = (val & M64).to_bytes(8, "little"); n = 8 if val > 0xffffffff else 4
-            raw = raw[:n]
-        else:
-            raw = (val if isinstance(val, bytes) else str(val).encode()) + b"\0"; n = len(raw)
-        if oldlenp: e.write(oldlenp, n.to_bytes(8, "little"))
-        if oldp: e.write(oldp, raw)
-        return 0
-    return _fail(e, EINVAL, 0xffffffff)
+def _sysctl(e):                                            # sysctl(int *mib, u_int n, void *old, size_t *oldlen, void *new, size_t newlen)
+    n = e.arg(1)
+    mib = [s32(int.from_bytes(e.read(e.arg(0) + 4 * i, 4), "little")) for i in range(min(n, 4))] if e.arg(0) else []
+    name = spoof.mib_name(mib)
+    if name is None and len(mib) >= 2 and mib[0] == 6: name = "hw.ncpu"     # unknown CTL_HW leaf: historical default
+    if name is None: return _fail(e, EINVAL, 0xffffffff)
+    return _sysctl_core(e, name, e.arg(2), e.arg(3))
 @fn("sysconf")
 def _sysconf(e):
     # Darwin _SC_* values differ; answer the ones games ask (pagesize, nproc, openmax).
@@ -789,6 +774,17 @@ def _host_lib(path):
 def _dlopen(e):
     global _DLERR, _DLNEXT
     path = e.cstr(e.arg(0)) if e.arg(0) else ""
+    # Prefer mapping arm64 guest code into Unicorn over host dlopen (wrong arch on Intel).
+    if path:
+        try:
+            import dylib as _dylib
+            if _dylib.is_arm64_macho(path) and _dylib.load_path(e, path):
+                h = _DLNEXT; _DLNEXT += 16
+                _DL[h] = ("guest", path)
+                return h
+        except Exception as ex:
+            if os.environ.get("ARM2X86_VERBOSE"):
+                sys.stderr.write(f"[dlopen] guest load {path}: {ex}\n")
     lib = _host_lib(path or None)
     if lib is None:
         _DLERR = f"arm2x86 dlopen: no host library for {path or 'NULL'} (guest arm64 dylibs are not mapped)"
@@ -807,9 +803,24 @@ def _dlsym(e):
     if sym in FUNCS or name in FUNCS:
         return e.resolve(sym if sym in FUNCS else name)
     h = e.arg(0)
-    lib = _DL.get(h, (None, ""))[0] if h in _DL else None
+    entry = _DL.get(h)
+    lib = entry[0] if entry else None
+    if lib == "guest":
+        exp = getattr(e, "dylib_exports", {}) or {}
+        for key in (name, "_" + name, sym):
+            if key in exp: return exp[key]
+        try:
+            import dylib as _dylib
+            for key in (name, "_" + name, sym):
+                if key in _dylib._EXPORTS: return _dylib._EXPORTS[key]
+        except Exception:
+            pass
+        _DLERR = f"dlsym: {name} not found in guest image"
+        return 0
     if lib is None and _DL:
         lib = next(iter(_DL.values()))[0]
+        if lib == "guest":
+            return 0
     if lib is not None:
         try:
             fnp = getattr(lib, name)
@@ -1052,7 +1063,12 @@ def _sig(e): return 0
 def _raise(e): return 0
 @fn("__assert_rtn", "__assert_fail")
 def _assert(e):
-    sys.stderr.write("[arm2x86] assertion failed\n"); e.exit(134)
+    try:   # Darwin __assert_rtn(func, file, line, expr)
+        sys.stderr.write("[arm2x86] Assertion failed: (%s), function %s, file %s, line %d.\n" % (
+            e.cstr(e.arg(3)), e.cstr(e.arg(0)), e.cstr(e.arg(1)), e.arg(2) & 0xffffffff))
+    except Exception:
+        sys.stderr.write("[arm2x86] assertion failed\n")
+    e.exit(134)
 
 # ----------------------------------------------------------------- sockets
 # Enough of BSD sockets for an engine to resolve a host and open a TCP fd.
@@ -1210,21 +1226,27 @@ def _htonl(e):
     return int.from_bytes(v.to_bytes(4, "little"), "big")
 
 # --------------------------------------------------------------- dispatch / os_log
-@fn("dispatch_once", "dispatch_once_f")
+# dispatch_once(pred*, block) and dispatch_once_f(pred*, ctx, fn) are DIFFERENT calls.  They used to share one function that told
+# them apart by "is x2 non-zero": for dispatch_once x2 is just a leftover register (0x20 here), so the block was never run and the
+# emulator jumped to address 0x20 (UC_ERR_FETCH_UNMAPPED pc=0x20) -- right after OSISClient's first dispatch_once.
+@fn("dispatch_once")
 def _donce(e):
-    # dispatch_once(predicate*, block) OR dispatch_once_f(predicate*, ctx, fn)
     pred = e.arg(0)
     if pred and int.from_bytes(e.read(pred, 8), "little") == 0:
-        e.write(pred, (1).to_bytes(8, "little"))
-        if "once_f" in sys._getframe().f_code.co_name or e.arg(2):
-            fnp, ctx = e.arg(2), e.arg(1)
-            if fnp and hasattr(e, "begin_callbacks"):
-                e.begin_callbacks([(fnp, [ctx])], 0); return None
-        else:
-            blk = e.arg(1)
-            if blk and hasattr(e, "begin_callbacks"):
-                imp = int.from_bytes(e.read(blk + 16, 8), "little")
-                e.begin_callbacks([(imp, [blk])], 0); return None
+        e.write(pred, (0xffffffffffffffff).to_bytes(8, "little"))      # "done" (libdispatch stores ~0)
+        blk = e.arg(1)
+        if blk and hasattr(e, "begin_callbacks"):
+            imp = int.from_bytes(e.read(blk + 16, 8), "little")           # Block_layout.invoke
+            e.begin_callbacks([(imp, [blk])], 0); return None
+    return None
+@fn("dispatch_once_f")
+def _donce_f(e):
+    pred = e.arg(0)
+    if pred and int.from_bytes(e.read(pred, 8), "little") == 0:
+        e.write(pred, (0xffffffffffffffff).to_bytes(8, "little"))
+        fnp, ctx = e.arg(2), e.arg(1)
+        if fnp and hasattr(e, "begin_callbacks"):
+            e.begin_callbacks([(fnp, [ctx])], 0); return None
     return None
 @fn("dispatch_get_global_queue", "dispatch_get_main_queue", "dispatch_queue_create")
 def _dgq(e): return 1

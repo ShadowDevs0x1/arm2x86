@@ -10,6 +10,7 @@ CASES = [  # (binary, args, expected exit code, substrings expected in stdout)
     ("tests/chained_2",   [],            9, ["bind ok", "rebase ok"]),
     ("tests/chained_6",   [],            9, ["bind ok", "rebase ok"]),
     ("tests/chained_9",   [],            9, ["bind ok", "rebase ok"]),
+    ("tests/cxxtest",     [],            0, ["value=-7 pi=3.14159"]),   # ctor-returns-this + std::cout
 ]
 GL = [  # need a display (Linux: xvfb-run -a python3 run_tests.py; on a Mac the window just opens)
     ("tests/gltest", [], 0, ["fragment shader compiled: 1", "center pixel=(255,0,0)", "key callback received: key=65 action=1"],

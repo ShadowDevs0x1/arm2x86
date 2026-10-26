@@ -5,6 +5,7 @@ Extra libSystem / libc++ / CoreGraphics emulation found missing by real apps
 import os, sys, struct, math, ctypes
 from unicorn.arm64_const import *
 from hle import FUNCS, M64, s32, format_c
+import spoof
 
 def fn(*names):
     def deco(f):
@@ -144,7 +145,7 @@ def _tolower(e): c = e.arg(0) & 0xff; return c + 32 if 65 <= c <= 90 else c
 _EOF = set()
 @fn("fopen$DARWIN_EXTSN", "fopen")
 def _fopen(e):
-    path, mode = e.cstr(e.arg(0)), e.cstr(e.arg(1))
+    path, mode = spoof.map_path(e.cstr(e.arg(0))), e.cstr(e.arg(1))
     plus = "+" in mode
     if mode[:1] == "r": fl = os.O_RDWR if plus else os.O_RDONLY
     elif mode[:1] == "w": fl = (os.O_RDWR if plus else os.O_WRONLY) | os.O_CREAT | os.O_TRUNC

@@ -11,7 +11,7 @@ import struct, sys, os, faulthandler
 faulthandler.enable()          # host-side segfaults now print the Python stack
 from unicorn import *
 from unicorn.arm64_const import *
-import hle, libcxx, hostsys, objc, cocoa, vk, gfx, extras   # each one registers into hle.FUNCS / RESOLVERS
+import hle, spoof, libcxx, hostsys, objc, cocoa, vk, gfx, extras, extras2, cxxio, cxxstr, sdl3bridge, extras3, dylib   # each one registers into hle.FUNCS / RESOLVERS
 
 MH_MAGIC_64, FAT_MAGIC, CPU_ARM64 = 0xfeedfacf, 0xcafebabe, 0x0100000c
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_MAIN = 0x19, 0x5, 0x80000028
@@ -88,6 +88,7 @@ class Emu:
         self.mo = Macho(read_arm64_slice(open(path, "rb").read()))
         self.path, self.argv = os.path.abspath(path), [path] + argv
         self.uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
+        self.uc.ctl_set_cpu_model(UC_CPU_ARM64_MAX)   # ARMv8.x extensions Apple compilers emit (SHA3 EOR3, LSE atomics, ...)
         self.exit_code = None
         self.stubs, self.stub_names = {}, []      # name -> addr
         self.cells, self.next_cell = {}, DATA_BASE
@@ -168,6 +169,7 @@ class Emu:
             uc.mem_map(base, size)
         self.errno_addr = self.malloc(8)
         uc.reg_write(UC_ARM64_REG_CPACR_EL1, uc.reg_read(UC_ARM64_REG_CPACR_EL1) | (3 << 20))
+        self.dylib_inits = dylib.load_bundled(self)           # the app's own arm64 dylibs (libfreetype) run inside the guest
         if mo.chained: self.apply_chained(*mo.chained)
         elif mo.dyld_info: self.apply_classic(mo.dyld_info)
         self.exit_stub = self.resolve("_exit")
@@ -280,8 +282,21 @@ class Emu:
         self.cb_frames.append(dict(lr=self.uc.reg_read(UC_ARM64_REG_LR), calls=[(addr, None)],
                                    ret=0, preserve=True))
         self._next_cb()
+    def begin_gen(self, gen):
+        """Drive a Python generator that YIELDS (guest_addr, [args]) and is sent each callee's x0.
+        Its return value becomes x0 for the original caller. Needed for qsort/bsearch comparators."""
+        self.cb_frames.append(dict(lr=self.uc.reg_read(UC_ARM64_REG_LR), calls=[], gen=gen, first=True,
+                                   ret=0, preserve=False))
+        self._next_cb()
     def _next_cb(self):
         uc, f = self.uc, self.cb_frames[-1]
+        if "gen" in f:
+            try:
+                step = next(f["gen"]) if f.pop("first", False) else f["gen"].send(uc.reg_read(UC_ARM64_REG_X0))
+            except StopIteration as si:
+                f["ret"] = int(si.value or 0) & M64; del f["gen"]
+            else:
+                f["calls"] = [step]
         if f["calls"]:
             addr, args = f["calls"].pop(0); xi = fi = 0
             if args is not None:
@@ -439,19 +454,115 @@ class Emu:
         return self.mo.entry
     def _n_runnable(self):
         return sum(1 for t in self.threads.values() if t["state"] == "run")
-    def _on_block(self, uc, address, size, _):
-        self._blocks += 1
-        if self._blocks % 40: return
-        if self._n_runnable() < 2: return
+    def _switch(self, cur_pc):
+        """Suspend the current guest thread at cur_pc and resume another runnable one. Rewriting PC after the context
+        restore is what makes Unicorn abandon the translation block it is in (a bare context_restore inside a hook let the
+        old block finish with the NEW thread's registers, so the other thread never really resumed)."""
+        uc = self.uc
+        opts = [t for t, i in self.threads.items() if i["state"] == "run" and t != self.current_tid and i.get("ctx") is not None]
+        if not opts: return False
+        uc.reg_write(UC_ARM64_REG_PC, cur_pc)
         self.threads[self.current_tid]["ctx"] = uc.context_save()
-        opts = [t for t, i in self.threads.items() if i["state"] == "run" and t != self.current_tid]
-        if not opts: return
         nxt = opts[self._blocks % len(opts)]
         self.current_tid = nxt
         uc.context_restore(self.threads[nxt]["ctx"])
-    def schedule(self, force=False):
+        uc.reg_write(UC_ARM64_REG_PC, uc.reg_read(UC_ARM64_REG_PC))
+        return True
+    def _on_block(self, uc, address, size, _):
+        self._blocks += 1
+        pr = getattr(self, "_prof", None)
+        if pr is not None: pr[address] = pr.get(address, 0) + 1
+        if self._blocks % 40: return
         if self._n_runnable() < 2: return
-        self._on_block(self.uc, self.uc.reg_read(UC_ARM64_REG_PC), 4, None)
+        self._switch(address)
+    def schedule(self, force=False):
+        """Called from a stub: yield to another thread as if the stub had already returned to its caller."""
+        if self._n_runnable() < 2: return
+        self._switch(self.uc.reg_read(UC_ARM64_REG_LR))
+    def _bl_note(self, uc, cs, ins):
+        """Name the import a bl/b targets, following the binary's own __stubs trampolines (adrp/ldr/br x16)."""
+        if ins.mnemonic not in ("bl", "b") or not ins.op_str.startswith("#"): return ""
+        try:
+            tgt = int(ins.op_str.lstrip("#"), 16)
+            def nm(a):
+                if STUB_BASE <= a < STUB_BASE + STUB_SIZE: return self.stub_names[(a - STUB_BASE) // STUB_STRIDE]
+            if nm(tgt): return "   ; -> " + nm(tgt)
+            d = list(cs.disasm(bytes(uc.mem_read(tgt, 12)), tgt))
+            if len(d) == 3 and d[0].mnemonic == "adrp" and d[1].mnemonic == "ldr" and d[2].mnemonic == "br":
+                page = int(d[0].op_str.split("#")[1], 16); off = int(d[1].op_str.split("#")[-1].rstrip("]"), 16) if "#" in d[1].op_str.split(",", 1)[1] else 0
+                p = int.from_bytes(bytes(uc.mem_read(page + off, 8)), "little")
+                return f"   ; -> {nm(p) or hex(p)} (via stub)"
+        except Exception: pass
+        return ""
+    def _dump_state(self):
+        uc = self.uc; pc = uc.reg_read(UC_ARM64_REG_PC); w = sys.stderr.write
+        try:
+            code = bytes(uc.mem_read(pc - 32, 80))
+        except UcError:
+            code = b""
+        dis = {}
+        try:
+            import capstone
+            for i in capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM).disasm(code, pc - 32):
+                dis[i.address] = f"{i.mnemonic} {i.op_str}"
+        except Exception: pass
+        w(f"  code around pc ({'capstone' if dis else 'raw words; pip3 install capstone for disassembly'}):\n")
+        for k in range(0, len(code) - 3, 4):
+            a = pc - 32 + k
+            w(f"   {'>' if a == pc else ' '} {a:#x}: {int.from_bytes(code[k:k+4], 'little'):08x}  {dis.get(a, '')}\n")
+        w("  regs: " + " ".join(f"x{i}={uc.reg_read(UC_ARM64_REG_X0 + i):#x}" for i in range(16)) + "\n")
+        w("  regs: " + " ".join(f"x{i}={uc.reg_read(UC_ARM64_REG_X0 + i):#x}" for i in range(16, 29)) +
+          f" fp={uc.reg_read(UC_ARM64_REG_FP):#x} lr={uc.reg_read(UC_ARM64_REG_LR):#x} sp={uc.reg_read(UC_ARM64_REG_SP):#x}\n")
+        for i in list(range(0, 8)) + list(range(19, 29)):
+            v = uc.reg_read(UC_ARM64_REG_X0 + i)
+            try:
+                if v > 0x10000: w(f"  [x{i}] {v:#x}: {bytes(uc.mem_read(v, 32)).hex()}\n")
+            except UcError: pass
+        fp, chain = uc.reg_read(UC_ARM64_REG_FP), []
+        for _ in range(10):
+            try:
+                nfp, ret = struct.unpack("<QQ", bytes(uc.mem_read(fp, 16)))
+            except UcError: break
+            chain.append(ret)
+            if nfp <= fp: break
+            fp = nfp
+        w("  frame-pointer chain (return addresses, innermost first): " + " ".join(f"{a:#x}" for a in chain) + "\n")
+        try:
+            import capstone
+            cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+            for ret in chain:
+                base = ret - 32
+                try: blob = bytes(uc.mem_read(base, 40))
+                except UcError: continue
+                w(f"  --- call site, returns to {ret:#x}:\n")
+                for ins in cs.disasm(blob, base):
+                    note = self._bl_note(uc, cs, ins)
+                    w(f"     {ins.address:#x}: {ins.mnemonic:6} {ins.op_str}{note}{'   <== return here' if ins.address + 4 == ret else ''}\n")
+        except Exception: pass
+        for pk in filter(None, os.environ.get("ARM2X86_PEEK", "").split(",")):      # ARM2X86_PEEK=0x107079a10:24,0x107079d80:64
+            try:
+                a, n = pk.split(":"); a, n = int(a, 16), int(n)
+                w(f"  peek {a:#x}: {bytes(uc.mem_read(a, n)).hex()}\n")
+            except Exception as ex: w(f"  peek {pk}: {ex}\n")
+        spec = os.environ.get("ARM2X86_DISASM")          # e.g. ARM2X86_DISASM=0x102fb35b0-0x102fb3720,0x102fb3638-0x102fb3700
+        if spec:
+            try:
+                import capstone
+                cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+                for rng in spec.split(","):
+                    lo, hi = (int(x, 16) for x in rng.split("-"))
+                    w(f"  --- disassembly {lo:#x}-{hi:#x}:\n")
+                    for ins in cs.disasm(bytes(uc.mem_read(lo, hi - lo)), lo):
+                        note = self._bl_note(uc, cs, ins)
+                        w(f"     {ins.address:#x}: {ins.mnemonic:7} {ins.op_str}{note}\n")
+            except Exception as ex: w(f"  (disasm failed: {ex})\n")
+        for tid, info in self.threads.items():
+            if tid == self.current_tid or info.get("ctx") is None: continue
+            try:
+                c = info["ctx"]
+                w(f"  thread {tid} ({info['state']}): pc={c.reg_read(UC_ARM64_REG_PC):#x} lr={c.reg_read(UC_ARM64_REG_LR):#x} "
+                  f"x19={c.reg_read(UC_ARM64_REG_X19):#x} x20={c.reg_read(UC_ARM64_REG_X20):#x}\n")
+            except Exception as ex: w(f"  thread {tid}: (cannot read saved context: {ex})\n")
     def spawn_thread(self, start, arg):
         tid = max(self.threads) + 1
         base = THREAD_BASE + (tid - 2) * (THREAD_STACK + 0x1000)
@@ -461,6 +572,7 @@ class Emu:
         fp = self.uc.reg_read(UC_ARM64_REG_FP)
         lr = self.uc.reg_read(UC_ARM64_REG_LR)
         sp_caller = self.uc.reg_read(UC_ARM64_REG_SP)
+        x0_caller = self.uc.reg_read(UC_ARM64_REG_X0)     # pthread_create's out-pointer: the stub reads it again after we return
         self.uc.reg_write(UC_ARM64_REG_SP, sp)
         self.uc.reg_write(UC_ARM64_REG_FP, 0)
         self.uc.reg_write(UC_ARM64_REG_X0, arg & M64)
@@ -470,7 +582,7 @@ class Emu:
         self.uc.reg_write(UC_ARM64_REG_SP, sp_caller)
         self.uc.reg_write(UC_ARM64_REG_FP, fp)
         self.uc.reg_write(UC_ARM64_REG_PC, lr)
-        self.uc.reg_write(UC_ARM64_REG_X0, 0)
+        self.uc.reg_write(UC_ARM64_REG_X0, x0_caller)
         self.threads[tid] = {"state": "run", "ctx": ctx, "wait": None}
         if not self._sched:
             self.uc.hook_add(UC_HOOK_BLOCK, self._on_block)
@@ -514,6 +626,7 @@ class Emu:
         nxt = opts[0]
         self.current_tid = nxt
         self.uc.context_restore(self.threads[nxt]["ctx"])
+        self.uc.reg_write(UC_ARM64_REG_PC, self.uc.reg_read(UC_ARM64_REG_PC))
 
     def setup_stack(self):
         uc = self.uc; sp = STACK_TOP - 0x1000
@@ -547,10 +660,16 @@ class Emu:
             if f is None:
                 if os.environ.get("ARM2X86_STRICT") == "1":
                     sys.stderr.write(f"[arm2x86] unimplemented import {name} called\n"); self.exit(127); return
+                r = None
+                for fb in hle.FALLBACKS:
+                    r = fb(self, name)
+                    if r is not None: break
                 if name not in self.warned:
                     self.warned.add(name)
-                    sys.stderr.write(f"[arm2x86] unimplemented {name} -> 0 (set ARM2X86_STRICT=1 to abort)\n")
-                uc.reg_write(UC_ARM64_REG_X0, 0); return
+                    what = "x0 kept (returns this)" if r is hle.KEEP else ("handled" if r is not None else "0")
+                    sys.stderr.write(f"[arm2x86] unimplemented {name} -> {what} (set ARM2X86_STRICT=1 to abort)\n")
+                if r is hle.KEEP: return
+                uc.reg_write(UC_ARM64_REG_X0, (r or 0) & M64); return
             self.last_stubs = (getattr(self, "last_stubs", []) + [name])[-8:]
             try: r = f(self)
             except UcError as ex:
@@ -558,6 +677,7 @@ class Emu:
                 self.exit(139); return
             if r is not None: uc.reg_write(UC_ARM64_REG_X0, r & M64)
         self.uc.hook_add(UC_HOOK_CODE, on_stub, begin=STUB_BASE, end=STUB_BASE + STUB_SIZE)
+        objc.install_stub_data_hook(self)
         def on_intr(uc, intno, _):
             if intno == 1 and self.pac_shim(uc): return          # UNDEFINED insn: try PAC emulation
             if intno != 2:
@@ -570,23 +690,92 @@ class Emu:
         self.uc.hook_add(UC_HOOK_INTR, on_intr)
         self.setup_stack()
         loads = objc.guest_load_calls(self)
-        inits = [(p, None) for p in self.collect_inits()]
+        inits = [(p, None) for p in getattr(self, 'dylib_inits', []) + self.collect_inits()]
         self._boot = loads + inits
         start = self._boot_next() if self._boot else self.mo.entry
         if self.missing and os.environ.get("ARM2X86_VERBOSE"):
             print("[arm2x86] imports with no emulation yet:", ", ".join(sorted(set(self.missing))), file=sys.stderr)
+        import signal
+        self._interrupted = False
+        self._prof = {}
+        def _sigint(signum, frame):
+            self._interrupted = True; self.uc.emu_stop()
+        signal.signal(signal.SIGINT, _sigint)
+        if os.environ.get("ARM2X86_TIMEOUT"):          # auto-interrupt (and print the report) after N seconds
+            signal.signal(signal.SIGALRM, _sigint); signal.alarm(int(os.environ["ARM2X86_TIMEOUT"]))
         try:
             self.uc.emu_start(start, 0xffffffffffffffff)
+            if self._interrupted:
+                uc = self.uc; top = sorted(self._prof.items(), key=lambda kv: -kv[1])[:12]
+                sys.stderr.write(f"\n[arm2x86] interrupted. pc={uc.reg_read(UC_ARM64_REG_PC):#x} lr={uc.reg_read(UC_ARM64_REG_LR):#x} "
+                                 f"tid={self.current_tid} threads={ {t: (i['state'], i.get('wait')) for t, i in self.threads.items()} }\n"
+                                 f"  last calls: {getattr(self, 'last_stubs', [])}\n  hottest blocks: " +
+                                 ", ".join(f"{a:#x}x{n}" for a, n in top) + "\n")
+                self._dump_state()
+                return 130
         except UcError as e:
             pc = self.uc.reg_read(UC_ARM64_REG_PC)
-            print(f"[fault] {e} at pc={pc:#x}", file=sys.stderr)
+            print(f"[fault] {e} at pc={pc:#x} lr={self.uc.reg_read(UC_ARM64_REG_LR):#x} tid={self.current_tid} last calls: {getattr(self, 'last_stubs', [])}", file=sys.stderr)
             for i in range(0, 8): print(f"  x{i} = {self.uc.reg_read(UC_ARM64_REG_X0+i):#x}", file=sys.stderr)
             return 139
-        return self.exit_code if self.exit_code is not None else 0
+        code = self.exit_code if self.exit_code is not None else 0
+        sys.stderr.write(f"[arm2x86] guest stopped: exit code {code}"
+                         f"{' (via exit()/_exit)' if self.exit_code is not None else ' (main returned or the run loop stopped)'}; "
+                         f"last calls: {getattr(self, 'last_stubs', [])}\n")
+        return code
+
+# ---- qsort / qsort_r / bsearch with the GUEST comparator (the old stub sorted by raw bytes -> guest asserts) ----
+def _s32(v): v &= 0xffffffff; return v - (1 << 32) if v >> 31 else v
+def _qsort_impl(e, reentrant):
+    base, n, size = e.arg(0), e.arg(1), e.arg(2)
+    thunk, cmp = (e.arg(3), e.arg(4)) if reentrant else (None, e.arg(3))
+    def call(a, b): return (cmp, [thunk, a, b] if reentrant else [a, b])
+    if not base or n < 2 or not size or not cmp or n > 5_000_000: return None
+    blob = bytes(e.read(base, n * size))
+    busy = getattr(e, "_qs_busy", 0)
+    if busy or getattr(e, "_qs_cap", 0) < len(blob):             # reuse one scratch buffer; fresh one if nested
+        tmp = e.malloc(len(blob))
+        if not busy: e._qs_tmp, e._qs_cap = tmp, len(blob)
+    else: tmp = e._qs_tmp
+    e.write(tmp, blob); e._qs_busy = busy + 1
+    def msort(idx):
+        if len(idx) < 2: return idx
+        mid = len(idx) // 2
+        L = yield from msort(idx[:mid]); R = yield from msort(idx[mid:])
+        out, i, j = [], 0, 0
+        while i < len(L) and j < len(R):
+            r = yield call(tmp + L[i] * size, tmp + R[j] * size)
+            if _s32(r) <= 0: out.append(L[i]); i += 1
+            else: out.append(R[j]); j += 1
+        return out + L[i:] + R[j:]
+    def driver():
+        try:
+            order = yield from msort(list(range(n)))
+            e.write(base, b"".join(blob[k * size:(k + 1) * size] for k in order))
+        finally: e._qs_busy -= 1
+        return 0
+    e.begin_gen(driver()); return None
+def _bsearch_impl(e):
+    key, base, n, size, cmp = e.arg(0), e.arg(1), e.arg(2), e.arg(3), e.arg(4)
+    def driver():
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            r = _s32((yield (cmp, [key, base + mid * size])))
+            if r == 0: return base + mid * size
+            if r < 0: hi = mid
+            else: lo = mid + 1
+        return 0
+    e.begin_gen(driver()); return None
+hle.FUNCS["_qsort"] = lambda e: _qsort_impl(e, False)
+hle.FUNCS["_qsort_r"] = lambda e: _qsort_impl(e, True)
+hle.FUNCS["_bsearch"] = _bsearch_impl
 
 if __name__ == "__main__":
+    if "--kern26" in sys.argv:                  # loader option (not passed to the guest): report macOS 27 / Darwin 26 / Apple M5
+        sys.argv.remove("--kern26"); os.environ["ARM2X86_KERN26"] = "1"
     if len(sys.argv) < 2: sys.exit(__doc__)
-    if not os.environ.get("ARM2X86_CHILD") and not os.environ.get("ARM2X86_NOFORK"):
+    if os.environ.get("ARM2X86_DEBUG") and not os.environ.get("ARM2X86_CHILD"):
         # supervisor: if the host process dies on a signal (segfault inside a bridged ObjC call), say which call it was
         import subprocess, tempfile
         fd, crumb = tempfile.mkstemp(prefix="a2x_crumb_"); os.close(fd)
@@ -600,4 +789,7 @@ if __name__ == "__main__":
         try: os.unlink(crumb)
         except OSError: pass
         sys.exit(rc if rc >= 0 else 128 - rc)
-    e = Emu(sys.argv[1], sys.argv[2:]); e.load(); sys.exit(e.run())
+    e = Emu(sys.argv[1], sys.argv[2:]); e.load(); rc = e.run()
+    try: sys.stdout.flush(); sys.stderr.flush()
+    except Exception: pass
+    os._exit(rc & 0xff if rc >= 0 else 1)     # skip interpreter teardown: other host threads (SDL audio) may still call into Python

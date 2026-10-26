@@ -140,12 +140,8 @@ _bind("Foundation", "NSFullUserName", "p")
 _bind("Foundation", "NSHomeDirectoryForUser", "pp")
 _bind("Foundation", "NSOpenStepRootDirectory", "p")
 _bind("Foundation", "NSSearchPathForDirectoriesInDomains", "puuc")
-_bind("Foundation", "NSStringFromClass", "pp")
 _bind("Foundation", "NSStringFromSelector", "pp")
 _bind("Foundation", "NSStringFromProtocol", "pp")
-_bind("Foundation", "NSSelectorFromString", "pp")
-_bind("Foundation", "NSClassFromString", "pp")
-_bind("Foundation", "NSProtocolFromString", "pp")
 _bind("Foundation", "NSZoneMalloc", "ppl")
 _bind("Foundation", "NSZoneCalloc", "ppll")
 _bind("Foundation", "NSZoneFree", "vpp")
@@ -593,6 +589,220 @@ def _present_opengl_app(e, guest):
 
 _UI = {}
 
+def _ns(text):
+    NSString = objc.host()["objc"].objc_getClass(b"NSString")
+    return objc.hmsg(NSString, "stringWithUTF8String:", str(text).encode() + b"\0",
+                     argtypes=[ctypes.c_char_p])
+
+def _arr_count(arr):
+    if not arr: return 0
+    return int(objc.hmsg(arr, "count", restype=ctypes.c_ulong, argtypes=[]) or 0)
+
+def _host_responds(obj, selname):
+    o = objc.host()["objc"]
+    cls = o.object_getClass(obj)
+    return bool(cls and o.class_getInstanceMethod(cls, _sel(selname)))
+
+_FMT_CBS = []
+def _formatter_stubs(o, cls, nsformatter):
+    """A guest NSFormatter subclass is published on the host with NO methods; AppKit then calls -stringForObjectValue: on it
+    while loading a nib and NSFormatter throws 'only defined for abstract class' (uncatchable from ctypes -> abort).
+    Give the host stand-in harmless concrete implementations."""
+    c = o.class_getSuperclass; c.restype, c.argtypes = ctypes.c_void_p, [ctypes.c_void_p]
+    k = c(cls)
+    while k and k != nsformatter: k = c(k)
+    if not k: return False
+    def s_for(self, sel, obj):
+        try:
+            if obj and _host_responds(obj, "description"): return _retain(objc.hmsg(obj, "description"))
+        except Exception: pass
+        return _retain(_ns(""))
+    def get_obj(self, sel, outobj, string, outerr):
+        if outobj: ctypes.c_void_p.from_address(outobj).value = string
+        return 1
+    a = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(s_for)
+    b = ctypes.CFUNCTYPE(ctypes.c_int8, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(get_obj)
+    _FMT_CBS.extend((a, b))
+    o.class_addMethod(cls, _sel("stringForObjectValue:"), ctypes.cast(a, ctypes.c_void_p), b"@@:@")
+    o.class_addMethod(cls, _sel("getObjectValue:forString:errorDescription:"), ctypes.cast(b, ctypes.c_void_p), b"c@:^@@^@")
+    return True
+
+def _publish_guest_classes(e):
+    """Host nib unarchiver looks classes up by name. Methods still run in the guest."""
+    if not DARWIN: return 0
+    o = objc.host()["objc"]
+    o.objc_allocateClassPair.restype = ctypes.c_void_p
+    o.objc_allocateClassPair.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+    o.objc_registerClassPair.argtypes = [ctypes.c_void_p]
+    o.class_addMethod.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
+    o.class_addMethod.restype = ctypes.c_bool
+    nsobj = o.objc_getClass(b"NSObject")
+    init_cb = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(lambda s, sel: s)
+    awake_cb = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)(lambda s, sel: None)
+    _HOST_CBS.extend((init_cb, awake_cb))
+    n = 0
+    for c in list(objc.CLASSES.values()):
+        if c.get("is_meta"): continue
+        raw = c["name"].encode()
+        if not raw or o.objc_getClass(raw): continue
+        sup = c["super"] if objc.host_ok(e, c["super"]) else 0
+        if not sup or sup in objc.CLASSES:
+            # Walk guest supers until a host class, else NSObject.
+            g = objc.CLASSES.get(c["super"])
+            sup = nsobj
+            seen = set()
+            while g and g["addr"] not in seen:
+                seen.add(g["addr"])
+                if objc.host_ok(e, g["super"]):
+                    sup = g["super"]
+                    break
+                g = objc.CLASSES.get(g["super"])
+        cls = o.objc_allocateClassPair(sup or nsobj, raw, 0)
+        if not cls: continue
+        o.class_addMethod(cls, _sel("init"), ctypes.cast(init_cb, ctypes.c_void_p), b"@@:")
+        o.class_addMethod(cls, _sel("awakeFromNib"), ctypes.cast(awake_cb, ctypes.c_void_p), b"v@:")
+        try: _formatter_stubs(o, cls, o.objc_getClass(b"NSFormatter"))
+        except Exception as ex: sys.stderr.write(f"[cocoa] formatter stubs for {c['name']}: {ex}\n")
+        o.objc_registerClassPair(cls)
+        objc.note_host(cls)
+        n += 1
+    return n
+
+def _order_front(app):
+    if not app: return 0
+    wins = objc.hmsg(app, "windows")
+    n = _arr_count(wins)
+    for i in range(n):
+        w = objc.hmsg(wins, "objectAtIndex:", i, argtypes=[ctypes.c_ulong])
+        if w and _host_responds(w, "orderFrontRegardless"):
+            objc.hmsg(w, "orderFrontRegardless", restype=None, argtypes=[])
+    return n
+
+def _load_named_nib(bundle, app, nib):
+    name = _ns(nib)
+    if _host_responds(bundle, "loadNibNamed:owner:topLevelObjects:"):
+        ok = objc.hmsg(bundle, "loadNibNamed:owner:topLevelObjects:", name, app, None,
+                       restype=ctypes.c_bool,
+                       argtypes=[ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p])
+        if ok: return True
+    NSBundle = objc.host()["objc"].objc_getClass(b"NSBundle")
+    return bool(objc.hmsg(NSBundle, "loadNibNamed:owner:", name, app,
+                          restype=ctypes.c_bool,
+                          argtypes=[ctypes.c_void_p, ctypes.c_void_p]))
+
+# ---- app identity: Dock icon / name, and the installer's own windows ---------------------------------------------------------
+def _set_identity(e, app, app_path, res, info):
+    """Make the process look like the installer: its real icon in the Dock/Cmd-Tab and its name in the menu bar/Dock."""
+    o = objc.host()["objc"]
+    name = str(info.get("CFBundleDisplayName") or info.get("CFBundleName") or os.path.basename(app_path or "App")[:-4])
+    try:
+        pi = objc.hmsg(o.objc_getClass(b"NSProcessInfo"), "processInfo")
+        objc.hmsg(pi, "setProcessName:", _ns(name), restype=None, argtypes=[ctypes.c_void_p])
+    except Exception as ex: sys.stderr.write(f"[cocoa] setProcessName: {ex}\n")
+    # Dock label: private LaunchServices call, best effort (the label stays "Python" if this OS refuses it)
+    try:
+        asv = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        asv._LSGetCurrentApplicationASN.restype = ctypes.c_void_p
+        asv._LSSetApplicationInformationItem.restype = ctypes.c_int32
+        asv._LSSetApplicationInformationItem.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        key = ctypes.c_void_p.in_dll(asv, "_kLSDisplayNameKey")
+        r = asv._LSSetApplicationInformationItem(-2, asv._LSGetCurrentApplicationASN(), key, _ns(name), None)
+        sys.stderr.write(f"[cocoa] Dock name '{name}' (LaunchServices status {r})\n")
+    except Exception as ex: sys.stderr.write(f"[cocoa] Dock name not changed: {ex}\n")
+    img = 0
+    try:
+        icns = info.get("CFBundleIconFile")
+        if icns and res:
+            p = os.path.join(res, icns if os.path.splitext(icns)[1] else icns + ".icns")
+            if os.path.isfile(p):
+                img = objc.hmsg(objc.hmsg(o.objc_getClass(b"NSImage"), "alloc"), "initWithContentsOfFile:", _ns(p),
+                                argtypes=[ctypes.c_void_p])
+        if not img and app_path:                                  # Assets.car icons (CFBundleIconName): let Finder resolve it
+            ws = objc.hmsg(o.objc_getClass(b"NSWorkspace"), "sharedWorkspace")
+            img = objc.hmsg(ws, "iconForFile:", _ns(app_path), argtypes=[ctypes.c_void_p])
+        if img:
+            objc.hmsg(app, "setApplicationIconImage:", img, restype=None, argtypes=[ctypes.c_void_p])
+            sys.stderr.write("[cocoa] Dock icon set from the installer bundle\n")
+        else: sys.stderr.write("[cocoa] no icon found in the installer bundle\n")
+    except Exception as ex: sys.stderr.write(f"[cocoa] icon: {ex}\n")
+
+_UI = {"shown": set()}
+# secondary windows: the guest shows them on demand (password prompt, ...); showing them at start-up is wrong
+_AUX_WINDOWS = {"IAUserAuthWindowController"}
+def _ensure_windows(e):
+    """Show every host NSWindowController proxy the guest created (e.g. IASetupController -> IASetupWindow) once, as soon as
+    it exists. The guest's classes from IA.bundle are published first so the nib can instantiate its custom views."""
+    hp = getattr(objc, "HOST_PROXY", None)
+    if not DARWIN or not hp: return
+    new = [g for g in list(hp) if g not in _UI["shown"]]
+    if not new: return
+    app = getattr(e, "nsapp", None)
+    try: _publish_guest_classes(e)
+    except Exception as ex: sys.stderr.write(f"[cocoa] publish classes: {ex}\n")
+    for g in new:
+        _UI["shown"].add(g); wc = hp[g]
+        try:
+            w = objc.hmsg(wc, "window")
+            if not w: sys.stderr.write(f"[cocoa] proxy {wc:#x}: its nib has no window\n"); continue
+            # the nib is loaded: its outlets now sit in the guest controller's ivars -> run the guest's own setup code
+            try:
+                gcls = objc.CLASSES.get(struct.unpack("<Q", bytes(e.read(g, 8)))[0])
+                for nm in ("awakeFromNib", "windowDidLoad"):
+                    imp = objc.lookup(gcls, nm, False) if gcls else None
+                    if imp:
+                        with objc._LOCK: objc.PENDING.append((imp, [g, objc.sel_guest(e, nm)]))
+                        sys.stderr.write(f"[cocoa] queued guest -[{gcls['name']} {nm}]\n")
+            except Exception as ex: sys.stderr.write(f"[cocoa] guest window setup: {ex}\n")
+            gname = ""
+            try: gname = objc.CLASSES.get(struct.unpack("<Q", bytes(e.read(g, 8)))[0], {}).get("name", "")
+            except Exception: pass
+            if gname in _AUX_WINDOWS and not os.environ.get("ARM2X86_SHOW_ALL_WINDOWS"):
+                # the nib has "Visible At Launch" set, so merely loading it (the -window call above) already put it on screen
+                for sel in ("orderOut:",):
+                    try: objc.hmsg(w, sel, 0)
+                    except Exception: pass
+                sys.stderr.write(f"[cocoa] {gname}: window hidden (the installer opens it itself when it needs it)\n"); continue
+            objc.hmsg(w, "center", restype=None, argtypes=[])
+            objc.hmsg(wc, "showWindow:", 0)
+            objc.hmsg(w, "makeKeyAndOrderFront:", 0)
+            objc.hmsg(w, "orderFrontRegardless", restype=None, argtypes=[])
+            if app: objc.hmsg(app, "activateIgnoringOtherApps:", 1, restype=None, argtypes=[ctypes.c_int])
+            sys.stderr.write(f"[cocoa] installer window shown (proxy {wc:#x}, window {w:#x}); WindowServer windows: {_arr_count(objc.hmsg(app, 'windows')) if app else '?'}\n")
+        except Exception as ex:
+            sys.stderr.write(f"[cocoa] showing window failed: {ex}\n")
+
+def _show_host_ui(e):
+    """Load MainMenu.nib (or whatever Info.plist names) through host AppKit.
+    Do not call _CFBundleSetMainBundle: that symbol is a ud2 trap on this OS."""
+    exe = getattr(e, "path", "") or ""
+    info = getattr(e, "bundle_info", {}) or {}
+    app_path, res = _app_paths(exe)
+    nib = str(info.get("NSMainNibFile") or "MainMenu")
+    sys.stderr.write("[cocoa] host UI v2 %s nib=%s\n" % (app_path or exe or "?", nib))
+    app = getattr(e, "nsapp", None)
+    if not app or not app_path:
+        sys.stderr.write("[cocoa] no host NSApp or .app bundle\n")
+        return 0
+    if _host_responds(app, "setActivationPolicy:"):
+        objc.hmsg(app, "setActivationPolicy:", 0, restype=ctypes.c_bool, argtypes=[ctypes.c_long])
+    bundle = objc.hmsg(objc.host()["objc"].objc_getClass(b"NSBundle"), "bundleWithPath:", _ns(app_path))
+    if not bundle:
+        sys.stderr.write("[cocoa] bundleWithPath failed\n")
+        return 0
+    e.app_bundle = _retain(bundle)
+    try:
+        ok = _load_named_nib(bundle, app, nib)
+        sys.stderr.write("[cocoa] nib '%s' -> %s\n" % (nib, bool(ok)))
+    except Exception as ex:
+        sys.stderr.write("[cocoa] nib '%s' failed: %s\n" % (nib, ex))
+    try: _set_identity(e, app, app_path, res, info)
+    except Exception as ex: sys.stderr.write(f"[cocoa] identity: {ex}\n")
+    if _host_responds(app, "activateIgnoringOtherApps:"):
+        objc.hmsg(app, "activateIgnoringOtherApps:", 1, restype=None, argtypes=[ctypes.c_int])
+    n = _order_front(app)
+    sys.stderr.write("[cocoa] WindowServer windows: %d\n" % n)
+    return n
+
 def _boot(e):
     info = _bundle_plist(getattr(e, "path", "") or "")
     e.bundle_info = info
@@ -601,29 +811,42 @@ def _boot(e):
     principal = info.get("NSPrincipalClass") or "NSApplication"
     e.delegate_obj = 0
     e.preinited_views = set()
+    for c in objc.CLASSES.values():
+        if c.get("is_meta"): continue
+        meths = ", ".join(sorted(c["methods"])[:24])
+        sys.stderr.write("[cocoa] class %s: %s\n" % (c["name"], meths or "(no methods)"))
     if DARWIN:
+        try:
+            n = _publish_guest_classes(e)
+            if n: sys.stderr.write("[cocoa] published %d guest class(es) on the host\n" % n)
+        except Exception as ex:
+            sys.stderr.write("[cocoa] publish guest classes: %s\n" % ex)
         try:
             NSApp = objc.host()["objc"].objc_getClass(principal.encode()) or objc.host()["objc"].objc_getClass(b"NSApplication")
             if NSApp:
-                app = objc.hmsg(NSApp, "sharedApplication")
-                if app: _publish(e, app)
+                happ = objc.hmsg(NSApp, "sharedApplication")
+                if happ: _publish(e, happ)
         except Exception as ex:
-            sys.stderr.write(f"[cocoa] sharedApplication: {ex}\n")
-        guest = _guest_view()
-        if guest and ("initWithFrame:" in guest["methods"]):
-            _present_opengl_app(e, guest)
+            sys.stderr.write("[cocoa] sharedApplication: %s\n" % ex)
+        try:
+            _show_host_ui(e)
+        except Exception as ex:
+            sys.stderr.write("[cocoa] host UI failed: %s\n" % ex)
+            import traceback; traceback.print_exc()
+        if os.environ.get("ARM2X86_PYWIN"):
+            guest = _guest_view()
+            if guest and "initWithFrame:" in guest["methods"]:
+                _present_opengl_app(e, guest)
     did = objc.find_delegate(e)
-    # Info.plist sometimes names the delegate as NSPrincipalClass when it isn't NSApplication.
-    if not did and principal not in ("NSApplication", "NSApplication") and principal in objc.BY_NAME:
+    if not did and principal not in ("NSApplication",) and principal in objc.BY_NAME:
         did = objc.BY_NAME[principal]
     if did:
         inst = objc.alloc_instance(e, objc.CLASSES[did])
         e.delegate_obj = inst
         e.delegate_class = did
-        if os.environ.get("ARM2X86_VERBOSE"):
-            sys.stderr.write(f"[cocoa] delegate {objc.CLASSES[did]['name']} @ {inst:#x}\n")
-    elif not getattr(e, "launch_call", None) and os.environ.get("ARM2X86_VERBOSE"):
-        sys.stderr.write("[cocoa] no guest AppDelegate; NSApp is up, no launch method to call\n")
+        sys.stderr.write("[cocoa] guest delegate %s\n" % objc.CLASSES[did]["name"])
+    else:
+        sys.stderr.write("[cocoa] no guest controller\n")
 
 def _publish(e, ptr):
     objc._publish_nsapp(e, ptr)
@@ -638,11 +861,14 @@ def delegate_calls(e):
     init = objc.lookup(cls, "init", False)
     if init:
         calls.append((init, [inst, objc.sel_guest(e, "init")]))
-    for sel in ("applicationWillFinishLaunching:", "applicationDidFinishLaunching:",
+    for sel in ("awakeFromNib", "applicationWillFinishLaunching:", "applicationDidFinishLaunching:",
                 "applicationDidBecomeActive:"):
         imp = objc.lookup(cls, sel, False)
         if imp:
-            calls.append((imp, [inst, objc.sel_guest(e, sel), 0]))
+            if sel.endswith(":"):
+                calls.append((imp, [inst, objc.sel_guest(e, sel), 0]))
+            else:
+                calls.append((imp, [inst, objc.sel_guest(e, sel)]))
     return calls
 
 def install(e):
@@ -669,6 +895,103 @@ def _stamp(e):
     e.write(p, struct.pack("<Ii", 0, 0))
     return p
 
+
+class _Rect(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double), ("w", ctypes.c_double), ("h", ctypes.c_double)]
+_STRET = {}
+def _frame_of(v):
+    """-[NSView frame]: a 32-byte NSRect is returned through memory on x86-64, i.e. via objc_msgSend_stret (plain objc_msgSend
+    with a struct return type crashed the dump with a bus error)."""
+    h = objc.host()["objc"]
+    if "f" not in _STRET:
+        _STRET["f"] = ctypes.CFUNCTYPE(None, ctypes.POINTER(_Rect), ctypes.c_void_p, ctypes.c_void_p)(
+            ctypes.cast(h.objc_msgSend_stret, ctypes.c_void_p).value)
+    r = _Rect()
+    _STRET["f"](ctypes.byref(r), v, h.sel_registerName(b"frame"))
+    return r
+def _cname(obj):
+    o = objc.host()["objc"]
+    o.object_getClass.restype, o.object_getClass.argtypes = ctypes.c_void_p, [ctypes.c_void_p]
+    o.class_getName.restype, o.class_getName.argtypes = ctypes.c_char_p, [ctypes.c_void_p]
+    return (o.class_getName(o.object_getClass(obj)) or b"?").decode()
+def _dump_view(v, depth, out):
+    try:
+        fr = _frame_of(v)
+        hid = objc.hmsg(v, "isHidden", restype=ctypes.c_ubyte, argtypes=[])
+        extra = ""
+        if _host_responds(v, "image") and _host_responds(v, "setImage:"):
+            im = objc.hmsg(v, "image")
+            extra = " image=" + ("nil" if not im else _cname(im))
+        if _host_responds(v, "title") and _host_responds(v, "setTitle:"):
+            t = objc.hmsg(v, "title")
+            if t: extra += " title=%r" % ctypes.string_at(objc.hmsg(t, "UTF8String")).decode("utf8", "replace")
+        out.append("  " * depth + f"{_cname(v)} frame=({fr.x:.0f},{fr.y:.0f},{fr.w:.0f},{fr.h:.0f}) hidden={bool(hid)}{extra}")
+        subs = objc.hmsg(v, "subviews")
+        n = _arr_count(subs) if subs else 0
+        for i in range(n):
+            _dump_view(objc.hmsg(subs, "objectAtIndex:", i, argtypes=[ctypes.c_ulong]), depth + 1, out)
+    except Exception as ex:
+        out.append("  " * depth + f"(dump failed: {ex})")
+
+def _force_continue(e, root):
+    """Fallback: the installer's Continue button stays hidden because its own logic waits for services we do not emulate yet
+    (IADiskManager, OSISClient ...). Unhide it and give it the arrow image so the UI can be driven.  ARM2X86_NO_FORCE_CONTINUE=1 disables."""
+    out = []
+    def walk(v):
+        subs = objc.hmsg(v, "subviews"); n = _arr_count(subs) if subs else 0
+        for i in range(n):
+            sv = objc.hmsg(subs, "objectAtIndex:", i, argtypes=[ctypes.c_ulong])
+            if _cname(sv) == "NSButton":
+                fr = _frame_of(sv)
+                if abs(fr.w - 95) < 3 and abs(fr.h - 60) < 3 and objc.hmsg(sv, "isHidden", restype=ctypes.c_ubyte, argtypes=[]) and not out:
+                    out.append(sv)
+            walk(sv)
+    walk(root)
+    if not out: return
+    b = out[0]; NSImage = objc.host()["objc"].objc_getClass(b"NSImage")
+    img = objc.hmsg(NSImage, "imageNamed:", objc._new_host_string("arrowbutton"))
+    alt = objc.hmsg(NSImage, "imageNamed:", objc._new_host_string("arrowbuttonPressed"))
+    objc.hmsg(b, "setHidden:", 0, restype=None, argtypes=[ctypes.c_ubyte])
+    if img:
+        objc.hmsg(b, "setImage:", img, restype=None); objc.hmsg(b, "setImagePosition:", 1, restype=None, argtypes=[ctypes.c_long])
+        objc.hmsg(b, "setBordered:", 0, restype=None, argtypes=[ctypes.c_ubyte])
+        if alt: objc.hmsg(b, "setAlternateImage:", alt, restype=None)
+    objc.hmsg(b, "setEnabled:", 1, restype=None, argtypes=[ctypes.c_ubyte])
+    _UI["cont"] = b
+    try:
+        tgt = objc.hmsg(b, "target"); act = objc.hmsg(b, "action", restype=ctypes.c_void_p, argtypes=[])
+        o = objc.host()["objc"]; o.sel_getName.restype, o.sel_getName.argtypes = ctypes.c_char_p, [ctypes.c_void_p]
+        an = (o.sel_getName(act) or b"").decode() if act else "(none)"
+        sys.stderr.write(f"[cocoa] Continue button: target={_cname(tgt) if tgt else 'nil'} {tgt or 0:#x} action={an}\n")
+        w = objc.hmsg(b, "window")
+        if w and not os.environ.get("ARM2X86_NO_CLOSABLE"):          # the installer's window has no close box; add one
+            sm = objc.hmsg(w, "styleMask", restype=ctypes.c_ulong, argtypes=[])
+            objc.hmsg(w, "setStyleMask:", sm | 2, restype=None, argtypes=[ctypes.c_ulong])
+    except Exception as ex: sys.stderr.write(f"[cocoa] continue info: {ex}\n")
+    sys.stderr.write(f"[cocoa] Continue button forced visible + enabled ({b:#x}, image {'arrowbutton' if img else 'MISSING'})\n")
+_DUMPED = []
+def _dump_ui_once(e):
+    """a few seconds after start-up (the guest's windowDidLoad has run by then): print the setup window's view tree"""
+    if _DUMPED or not DARWIN: return
+    t0 = _UI.setdefault("t0", time.time())
+    if not _UI["shown"] or time.time() - t0 < 4: return
+    _DUMPED.append(1)
+    app = getattr(e, "nsapp", None)
+    ws = objc.hmsg(app, "windows") if app else 0
+    out = ["[cocoa] ---- UI dump (ARM2X86_NO_UIDUMP=1 to disable) ----"]
+    for i in range(_arr_count(ws) if ws else 0):
+        w = objc.hmsg(ws, "objectAtIndex:", i, argtypes=[ctypes.c_ulong])
+        vis = objc.hmsg(w, "isVisible", restype=ctypes.c_ubyte, argtypes=[])
+        out.append(f"window {w:#x} {_cname(w)} visible={bool(vis)}")
+        if vis:
+            cv = objc.hmsg(w, "contentView")
+            if cv:
+                if not os.environ.get("ARM2X86_NO_FORCE_CONTINUE"):
+                    try: _force_continue(e, cv)
+                    except Exception as ex: sys.stderr.write(f"[cocoa] force continue: {ex}\n")
+                _dump_view(cv, 1, out)
+    sys.stderr.write("\n".join(out) + "\n")
+
 @fn("arm2x86_poll")
 def _poll(e):
     if getattr(e, "stop_app", False) or e.exit_code is not None:
@@ -676,6 +999,18 @@ def _poll(e):
     if hasattr(e, "schedule"):
         e.schedule(False)
     _pump_host(e)
+    try: _ensure_windows(e)
+    except Exception as ex: sys.stderr.write(f"[cocoa] ensure_windows: {ex}\n")
+    b = _UI.get("cont")
+    if b and time.time() - _UI.get("cont_t", 0) > 0.5:
+        _UI["cont_t"] = time.time()
+        try:
+            if not objc.hmsg(b, "isEnabled", restype=ctypes.c_ubyte, argtypes=[]): objc.hmsg(b, "setEnabled:", 1, restype=None, argtypes=[ctypes.c_ubyte])
+            if objc.hmsg(b, "isHidden", restype=ctypes.c_ubyte, argtypes=[]): objc.hmsg(b, "setHidden:", 0, restype=None, argtypes=[ctypes.c_ubyte])
+        except Exception: pass
+    if not os.environ.get("ARM2X86_NO_UIDUMP"):
+        try: _dump_ui_once(e)
+        except Exception as ex: sys.stderr.write(f"[cocoa] ui dump: {ex}\n")
     if getattr(e, "stop_app", False) or e.exit_code is not None:
         return 0
     frames = []
@@ -790,14 +1125,14 @@ FUNCS["_arm2x86_poll"] = _poll
 
 @fn("NSApplicationMain")
 def _nsappmain(e):
+    sys.stderr.write("[cocoa] NSApplicationMain v2: host nib, no CFBundleSetMainBundle\n")
+    sys.stderr.flush()
     _boot(e)
     calls = []
     if getattr(e, "launch_call", None):
         calls.append(e.launch_call)
-        sys.stderr.write("[cocoa] NSApplicationMain -> guest initWithFrame: then the run loop\n")
     extra = delegate_calls(e)
-    if not calls:
-        sys.stderr.write("[cocoa] NSApplicationMain delegate calls: %d\n" % len(extra))
+    sys.stderr.write("[cocoa] NSApplicationMain delegate calls: %d\n" % len(extra))
     calls.extend(extra)
     calls.append((e.resolve("_arm2x86_enter_runloop"), []))
     e.begin_callbacks(calls, 0)

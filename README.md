@@ -1,6 +1,8 @@
 # arm2x86 - run simple arm64 / arm64e macOS programs on an Intel Mac
 
     pip3 install unicorn glfw
+    pip3 install capstone
+    pip3 install pysdl3 && python3 gen_sdl3sigs.py
     python3 loader.py path/to/arm64-binary [args...]
     python3 run_tests.py            # on Linux: xvfb-run -a python3 run_tests.py
 

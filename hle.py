@@ -15,6 +15,8 @@ import os, re, sys, math, struct, time, random
 
 FUNCS = {}      # "_name" -> callable(emu) -> int | None
 DATA  = {}
+FALLBACKS = []   # callables(emu, name) -> hle.KEEP | int | None, tried for imports with no emulation
+KEEP = object() # 'leave x0 as it is' (C++ ctors/dtors/operators return this)
 RESOLVERS = []  # callables(emu, name) -> address | None, consulted before DATA/stubs      # "_name" -> initial 8-byte cell value (callable(emu) or int)
 
 def fn(*names):
@@ -45,7 +47,7 @@ DATA["___stderrp"] = FILE_BASE + 2
 DATA["___stack_chk_guard"] = 0x2f6a1c7d5b3e9a40
 
 # ---------------------------------------------------------------- printf ----
-_FMT = re.compile(r"%([-+ #0]*)(\d+|\*)?(?:\.(\d+|\*))?(hh|h|ll|l|z|j|t|L)?([diouxXeEfFgGcspn%])")
+_FMT = re.compile(r"%([-+ #0]*)(\d+|\*)?(?:\.(\d+|\*))?(hh|h|ll|l|z|j|t|L|q)?([diouxXeEfFgGcspn%])")
 
 def format_c(emu, fmt, next_int, next_double):
     out, pos = [], 0
@@ -59,7 +61,7 @@ def format_c(emu, fmt, next_int, next_double):
         if prec == "*": prec = s32(next_int())
         spec = "%" + flags + (str(width) if width not in (None, "") else "") \
                    + ("." + str(prec) if prec not in (None, "") else "")
-        wide = length in ("l", "ll", "z", "j", "t")
+        wide = length in ("l", "ll", "z", "j", "t", "q")
         if conv in "di":
             v = next_int(); v = s64(v) if wide else s32(v)
             out.append((spec + "d") % v)
