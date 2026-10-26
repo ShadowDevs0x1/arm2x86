@@ -62,11 +62,16 @@ def _bind(framework, name, sig):
             elif c == "c":
                 vals.append(s32(_iarg(e, xi)) & 0xff); xi += 1
             else:
-                vals.append(_iarg(e, xi) & M64); xi += 1
+                # pointer: guest Unicorn addresses are NOT valid host pointers
+                p = _iarg(e, xi) & M64; xi += 1
+                # guest image ~0x100000000+, stubs 0x300000000, heap 0x400000000+, threads 0x7f0000000000
+                if p and (0x100000000 <= p < 0x600000000 or p >= 0x7f0000000000):
+                    p = 0  # null out pure guest ptrs so host libc/CF does not SIGSEGV
+                vals.append(p)
         try:
             r = cfn(*vals)
         except Exception as ex:
-            sys.stderr.write(f"[cocoa] {name} failed: {ex}\n"); return 0
+            sys.stderr.write("[cocoa] %s failed: %s" % (name, ex) + chr(10)); return 0
         if ret == "v" or r is None: return None
         if ret == "d":
             e.ret_double(float(r)); return None

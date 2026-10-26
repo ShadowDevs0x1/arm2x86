@@ -22,10 +22,14 @@ EINVAL, ENOTDIR, EISDIR, ENOSYS, EPIPE = 22, 20, 21, 78, 32
 ENOTSUP, ETIMEDOUT, EDEADLK = 45, 60, 11
 
 _L2D = {1: EPERM, 2: ENOENT, 4: EINTR, 5: EIO, 9: EBADF, 11: EAGAIN, 12: ENOMEM,
-        13: EACCES, 14: EFAULT, 17: EEXIST, 20: ENOTDIR, 21: EISDIR, 22: EINVAL, 32: EPIPE}
+        13: EACCES, 14: EFAULT, 17: EEXIST, 20: ENOTDIR, 21: EISDIR, 22: EINVAL, 32: EPIPE,
+        111: 61}  # Linux ECONNREFUSED -> Darwin ECONNREFUSED
 
 def _derr(n):
-    return _L2D.get(getattr(n, "errno", None) or n, EINVAL)
+    e = getattr(n, "errno", None)
+    if e is None:
+        e = n if isinstance(n, int) else EINVAL
+    return _L2D.get(e, e)
 
 def _fail(e, err=EINVAL, ret=M64):
     set_errno(e, err); return ret
@@ -89,19 +93,74 @@ def _stat_into(e, st, p):
 def _open(e):
     path, flags = spoof.map_path(e.cstr(e.arg(0))), e.arg(1)
     mode = e.arg(2) & 0o777 or 0o666
-    try: return os.open(path, _oflags(flags), mode)
-    except OSError as ex: return _fail(e, _derr(ex))
+    parent = os.path.dirname(path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+            os.chmod(parent, 0o755)
+        except OSError:
+            pass
+    try:
+        if os.path.isdir(path):
+            import shutil
+            shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        pass
+    try:
+        fd = os.open(path, _oflags(flags), mode)
+    except OSError as ex:
+        # Last-ditch: remove and recreate parent for Application Support locks
+        if ex.errno in (13, 21, 17) and "Application Support" in path:
+            try:
+                import shutil
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                elif os.path.exists(path):
+                    os.unlink(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                    os.chmod(parent, 0o755)
+                fd = os.open(path, _oflags(flags), mode)
+            except OSError as ex2:
+                if os.environ.get("ARM2X86_VERBOSE"):
+                    sys.stderr.write("[open] %r flags=%#x failed: %s" % (path, flags, ex2) + chr(10))
+                return _fail(e, _derr(ex2))
+        else:
+            if os.environ.get("ARM2X86_VERBOSE"):
+                sys.stderr.write("[open] %r flags=%#x failed: %s" % (path, flags, ex) + chr(10))
+            return _fail(e, _derr(ex))
+    # Darwin O_EXLOCK / O_SHLOCK
+    try:
+        import fcntl
+        if flags & 0x20:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif flags & 0x10:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except Exception:
+        pass
+    return fd
+
+
 @fn("openat")
 def _openat(e):
     # ignore dirfd unless it's AT_FDCWD (-2)
     e.uc  # silence
     path = spoof.map_path(e.cstr(e.arg(1)))
+    parent = os.path.dirname(path)
+    if parent:
+        try: os.makedirs(parent, exist_ok=True)
+        except OSError: pass
     try: return os.open(path, _oflags(e.arg(2)), e.arg(3) & 0o777 or 0o666)
     except OSError as ex: return _fail(e, _derr(ex))
 @fn("close")
 def _close(e):
     fd = e.arg(0) & 0xffff
     if fd < 3: return 0
+    s = globals().get("_SOCKS", {}).pop(fd, None)
+    if s is not None:
+        try: s.close()
+        except OSError: pass
+        return 0
     try: os.close(fd); return 0
     except OSError as ex: return _fail(e, _derr(ex), 0xffffffff)
 @fn("lseek")
@@ -165,8 +224,11 @@ def _chdir(e):
     except OSError as ex: return _fail(e, _derr(ex), 0xffffffff)
 @fn("mkdir")
 def _mkdir(e):
-    try: os.mkdir(e.cstr(e.arg(0)), e.arg(1) & 0o777 or 0o755); return 0
-    except OSError as ex: return _fail(e, _derr(ex), 0xffffffff)
+    try:
+        os.makedirs(e.cstr(e.arg(0)), mode=(e.arg(1) & 0o777) or 0o755, exist_ok=True)
+        return 0
+    except OSError as ex:
+        return _fail(e, _derr(ex), 0xffffffff)
 @fn("rmdir", "unlink", "remove")
 def _unlink(e):
     p = e.cstr(e.arg(0))
@@ -209,12 +271,38 @@ def _ioctl(e): return 0
 def _isatty(e): return int(os.isatty(e.arg(0) & 0xffff))
 @fn("dup")
 def _dup(e):
-    try: return os.dup(e.arg(0) & 0xffff)
-    except OSError as ex: return _fail(e, _derr(ex))
+    old = e.arg(0) & 0xffff
+    try:
+        new = os.dup(old)
+    except OSError as ex:
+        return _fail(e, _derr(ex), 0xffffffff)
+    s = _SOCKS.get(old)
+    if s is not None:
+        _SOCKS[new] = s
+        if os.environ.get("ARM2X86_VERBOSE"):
+            sys.stderr.write("[sock] dup %d -> %d (socket)" % (old, new) + chr(10)); sys.stderr.flush()
+    return new
+
+
 @fn("dup2")
 def _dup2(e):
-    try: os.dup2(e.arg(0) & 0xffff, e.arg(1) & 0xffff); return e.arg(1) & 0xffff
-    except OSError as ex: return _fail(e, _derr(ex))
+    old = e.arg(0) & 0xffff
+    new = e.arg(1) & 0xffff
+    try:
+        os.dup2(old, new)
+    except OSError as ex:
+        return _fail(e, _derr(ex), 0xffffffff)
+    s = _SOCKS.get(old)
+    if s is not None:
+        _SOCKS[new] = s
+        if os.environ.get("ARM2X86_VERBOSE"):
+            sys.stderr.write("[sock] dup2 %d -> %d (socket)" % (old, new) + chr(10)); sys.stderr.flush()
+    elif new in _SOCKS:
+        # target is no longer that socket
+        _SOCKS.pop(new, None)
+    return new
+
+
 @fn("pipe")
 def _pipe(e):
     r, w = os.pipe()
@@ -654,18 +742,28 @@ def _punlock(e):
     if "destroy" in sys._getframe().f_code.co_name:
         _MUTEX.pop(e.arg(0), None)
     return 0
-@fn("pthread_cond_wait", "pthread_cond_timedwait")
+@fn("pthread_cond_wait", "pthread_cond_timedwait", "pthread_cond_timedwait_relative_np")
 def _pcw(e):
-    # unlock mutex, park, relock on wake. Without a real scheduler, return 0
-    # so single-threaded callers don't block forever.
-    _punlock(e) if False else None
+    # unlock mutex, park, relock on wake. Cooperative multi-thread: park if others runnable.
     c = _COND.setdefault(e.arg(0), [])
     if hasattr(e, "park_thread") and getattr(e, "n_runnable", lambda: 1)() > 1:
-        _punlock(e)
+        try:
+            # unlock the mutex arg if present
+            if e.arg(1):
+                m = _MUTEX.get(e.arg(1))
+                if m and m.get("owner") == _tid(e):
+                    m["owner"] = 0
+                    if m["waiters"] and hasattr(e, "wake_thread"):
+                        e.wake_thread(m["waiters"].pop(0))
+        except Exception:
+            pass
         c.append(_tid(e))
         e.park_thread("cond", e.arg(0))
-        _plock.__wrapped__ if False else _MUTEX.setdefault(e.arg(1), {"owner": 0, "waiters": []})
-        return None
+        return None  # park switches away; return value set on wake
+    # single runnable thread: brief yield then success (ETIMEDOUT confuses
+    # GPUI's profiler pairing of register_task_start / save_task_timing)
+    import time
+    time.sleep(0.0001)
     return 0
 @fn("pthread_cond_signal", "pthread_cond_broadcast")
 def _pcs(e):
@@ -720,6 +818,11 @@ def _pmisc(e):
 @fn("pthread_join")
 def _pjoin(e):
     tid = e.arg(0)
+    # Helper threads created under single-thread mode are parked forever;
+    # joining them must not park the main thread (that triggers exit(0)).
+    t = getattr(e, "threads", {}).get(tid)
+    if t and t.get("wait") and t["wait"][0] == "parked":
+        return 0
     if hasattr(e, "thread_alive") and e.thread_alive(tid):
         e.park_thread("join", tid)
         return None
@@ -784,12 +887,12 @@ def _dlopen(e):
                 return h
         except Exception as ex:
             if os.environ.get("ARM2X86_VERBOSE"):
-                sys.stderr.write(f"[dlopen] guest load {path}: {ex}\n")
+                sys.stderr.write(("[dlopen] guest load %s: %s" % (path, ex)) + chr(10))
     lib = _host_lib(path or None)
     if lib is None:
         _DLERR = f"arm2x86 dlopen: no host library for {path or 'NULL'} (guest arm64 dylibs are not mapped)"
         if os.environ.get("ARM2X86_VERBOSE"):
-            sys.stderr.write(_DLERR + "\n")
+            sys.stderr.write(_DLERR + "")
         return 0
     h = _DLNEXT; _DLNEXT += 16
     _DL[h] = (lib, path)
@@ -847,7 +950,7 @@ def _install_raw(name, fnp):
             r = _fn(*args)
             return (r or 0) & M64
         except Exception as ex:
-            sys.stderr.write(f"[dlsym] {name} raw call failed: {ex}\n")
+            sys.stderr.write(f"[dlsym] {name} raw call failed: {ex}")
             return 0
     FUNCS[sym] = wrap
 
@@ -1064,10 +1167,10 @@ def _raise(e): return 0
 @fn("__assert_rtn", "__assert_fail")
 def _assert(e):
     try:   # Darwin __assert_rtn(func, file, line, expr)
-        sys.stderr.write("[arm2x86] Assertion failed: (%s), function %s, file %s, line %d.\n" % (
-            e.cstr(e.arg(3)), e.cstr(e.arg(0)), e.cstr(e.arg(1)), e.arg(2) & 0xffffffff))
+        sys.stderr.write(("[arm2x86] Assertion failed: (%s), function %s, file %s, line %d." % (
+            e.cstr(e.arg(3)), e.cstr(e.arg(0)), e.cstr(e.arg(1)), e.arg(2) & 0xffffffff)) + chr(10))
     except Exception:
-        sys.stderr.write("[arm2x86] assertion failed\n")
+        sys.stderr.write("[arm2x86] assertion failed" + chr(10))
     e.exit(134)
 
 # ----------------------------------------------------------------- sockets
@@ -1084,6 +1187,62 @@ def _so(level, opt):
                0x1002: S.SO_RCVBUF, 0x1007: getattr(S, "SO_KEEPALIVE", 8)}
     if level == S.SOL_SOCKET and opt in mapping: opt = mapping[opt]
     return level, opt
+def _sockaddr_family(raw):
+    """Return (family, unix_path_or_None). Darwin BSD {sun_len,sun_family,path} and Linux-style."""
+    if len(raw) < 2:
+        return 0, None
+    b0, b1 = raw[0], raw[1]
+    # Darwin sockaddr_un: sun_len can be 0 (Rust often leaves it zero); family at offset 1.
+    if b1 == 1 and b0 != 2:
+        path = raw[2:]
+        nul = path.find(b"\0")
+        if nul >= 0:
+            path = path[:nul]
+        try:
+            return 1, path.decode("utf-8", "surrogateescape") if path else None
+        except Exception:
+            return 1, None
+    fam = struct.unpack_from("<H", raw)[0]
+    if fam == 1:
+        path = raw[2:]
+        nul = path.find(b"\0")
+        if nul >= 0:
+            path = path[:nul]
+        try:
+            return 1, path.decode("utf-8", "surrogateescape") if path else None
+        except Exception:
+            return 1, None
+    if fam == 2 or b0 == 2:
+        return 2, None
+    if fam == 30 or b1 == 30:
+        return 30, None
+    if b1 in (2, 30) and 2 <= b0 <= 110:
+        return b1, None
+    return fam, None
+
+@fn("socketpair")
+def _socketpair(e):
+    # int socketpair(int domain, int type, int protocol, int *sv)
+    dom = e.arg(0) & 0xff
+    typ = e.arg(1) & 0xff
+    proto = e.arg(2) & 0xff
+    sv = e.arg(3)
+    typ &= 0xf
+    if dom == 30: dom = socket.AF_INET6
+    if dom == 0: dom = socket.AF_UNIX  # PF_UNSPEC often used with AF_UNIX intent
+    try:
+        a, b = socket.socketpair(dom if dom else socket.AF_UNIX, typ or socket.SOCK_STREAM, proto or 0)
+        a.setblocking(False); b.setblocking(False)
+        fa, fb = a.fileno(), b.fileno()
+        _SOCKS[fa] = a; _SOCKS[fb] = b
+        if sv:
+            e.write(sv, struct.pack("<II", fa, fb))
+        if os.environ.get("ARM2X86_VERBOSE"):
+            sys.stderr.write("[sock] socketpair -> %d, %d" % (fa, fb) + chr(10)); sys.stderr.flush()
+        return 0
+    except OSError as ex:
+        return _fail(e, _derr(ex), 0xffffffff)
+
 @fn("socket")
 def _socket(e):
     dom, typ, proto = e.arg(0) & 0xff, e.arg(1) & 0xff, e.arg(2) & 0xff
@@ -1091,50 +1250,173 @@ def _socket(e):
     if dom == 30: dom = socket.AF_INET6
     typ &= 0xf  # strip SOCK_CLOEXEC/NONBLOCK in the high bits (Darwin packs differently)
     try:
-        return socket.socket(dom, typ or socket.SOCK_STREAM, proto).fileno() if False else _sock_fd(dom, typ or 1, proto)
+        return _sock_fd(dom, typ or 1, proto)
     except OSError as ex:
         return _fail(e, _derr(ex))
 _SOCKS = {}
+_LISTEN_FDS = set()
 def _sock_fd(dom, typ, proto):
     s = socket.socket(dom, typ or socket.SOCK_STREAM, proto or 0)
     s.setblocking(False)
-    _SOCKS[s.fileno()] = s
-    return s.fileno()
+    fd = s.fileno()
+    _SOCKS[fd] = s
+    if os.environ.get("ARM2X86_VERBOSE"):
+        sys.stderr.write("[sock] socket -> fd %d (dom=%d typ=%d)" % (fd, dom, typ) + chr(10)); sys.stderr.flush()
+    return fd
 def _sock(fd):
     fd &= 0xffff
     return _SOCKS.get(fd)
-@fn("connect")
+@fn("connect", "connect$NOCANCEL")
 def _connect(e):
     s = _sock(e.arg(0))
     if not s: return _fail(e, EBADF, 0xffffffff)
     n = e.arg(2) or 16
-    raw = bytes(e.read(e.arg(1), n))
-    family = struct.unpack_from("<H", raw)[0]
+    raw = bytes(e.read(e.arg(1), min(max(n, 0), 256)))
+    family, unix_path = _sockaddr_family(raw)
     try:
-        if family == 2 and n >= 8:  # AF_INET
+        if family == 2 and len(raw) >= 8:  # AF_INET
             port = struct.unpack_from("!H", raw, 2)[0]
             ip = socket.inet_ntoa(raw[4:8])
             s.setblocking(True); s.connect((ip, port)); s.setblocking(False)
-        else:
-            return _fail(e, EINVAL, 0xffffffff)
+            return 0
+        if family == 1:  # AF_UNIX — Delta single-instance IPC
+            path = unix_path
+            if not path:
+                sys.stderr.write(f"[sock] AF_UNIX connect: bad sockaddr ({len(raw)} bytes hex={raw[:16].hex()})")
+                return _fail(e, EINVAL, 0xffffffff)
+            parent = os.path.dirname(path)
+            if parent:
+                try: os.makedirs(parent, exist_ok=True)
+                except OSError: pass
+            if os.environ.get("ARM2X86_VERBOSE"):
+                sys.stderr.write(f"[sock] connect(AF_UNIX, {path!r})")
+            s.setblocking(True)
+            try:
+                s.connect(path)
+            finally:
+                try: s.setblocking(False)
+                except OSError: pass
+            return 0
+        sys.stderr.write(f"[sock] connect: unsupported family={family} n={n} hex={raw[:16].hex()}")
+        return _fail(e, EINVAL, 0xffffffff)
+    except OSError as ex:
+        # Crash handler / watchdog: pretend connected so Delta does not panic
+        if path and any(k in str(path) for k in ("crash-handler", "zed-crash", "watchdog")):
+            if os.environ.get("ARM2X86_VERBOSE"):
+                sys.stderr.write(("[sock] connect(AF_UNIX, %r) -> fake OK" % path) + chr(10))
+            return 0
+        # Missing socket path is ENOENT on Darwin; map to ECONNREFUSED (61).
+        err = _derr(ex)
+        if err == ENOENT:
+            err = 61  # Darwin ECONNREFUSED
+        if os.environ.get("ARM2X86_VERBOSE"):
+            sys.stderr.write(("[sock] connect failed: %s (guest errno=%s)" % (ex, err)) + chr(10))
+        return _fail(e, err, 0xffffffff)
+@fn("listen")
+def _listen(e):
+    s = _sock(e.arg(0))
+    if not s: return _fail(e, EBADF, 0xffffffff)
+    backlog = e.arg(1) & 0xffffffff
+    if backlog > 1024:
+        backlog = 128
+    try:
+        if os.environ.get("ARM2X86_VERBOSE"):
+            sys.stderr.write("[sock] listen backlog=%d" % backlog)
+        s.listen(backlog or 128)
+        _LISTEN_FDS.add(e.arg(0) & 0xffff)
         return 0
     except OSError as ex:
         return _fail(e, _derr(ex), 0xffffffff)
-@fn("bind", "listen", "shutdown")
+
+@fn("shutdown")
+def _shutdown(e):
+    s = _sock(e.arg(0))
+    if not s: return _fail(e, EBADF, 0xffffffff)
+    try:
+        s.shutdown(e.arg(1) & 0xff)
+        return 0
+    except OSError as ex:
+        return _fail(e, _derr(ex), 0xffffffff)
+
+@fn("bind")
 def _bind(e):
     s = _sock(e.arg(0))
     if not s: return _fail(e, EBADF, 0xffffffff)
     try:
-        name = sys._getframe().f_code.co_name
-        if "listen" in name: s.listen(e.arg(1) or 16)
-        elif "shutdown" in name: s.shutdown(e.arg(1) & 0xff)
+        raw = bytes(e.read(e.arg(1), min(e.arg(2) or 16, 256)))
+        family, unix_path = _sockaddr_family(raw)
+        if family == 1:
+            path = unix_path
+            if not path:
+                return _fail(e, EINVAL, 0xffffffff)
+            parent = os.path.dirname(path)
+            if parent:
+                try: os.makedirs(parent, exist_ok=True)
+                except OSError: pass
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+            except OSError:
+                pass
+            if os.environ.get("ARM2X86_VERBOSE"):
+                sys.stderr.write("[sock] bind(AF_UNIX, %r)" % path)
+            s.bind(path)
         else:
-            raw = bytes(e.read(e.arg(1), e.arg(2) or 16))
             port = struct.unpack_from("!H", raw, 2)[0]
             s.bind(("0.0.0.0", port))
         return 0
     except OSError as ex:
         return _fail(e, _derr(ex), 0xffffffff)
+
+@fn("accept", "accept$NOCANCEL")
+def _accept(e):
+    fd = e.arg(0) & 0xffff
+    s = _sock(fd)
+    if not s:
+        try:
+            import socket as _socket
+            s = _socket.fromfd(fd, _socket.AF_UNIX, _socket.SOCK_STREAM)
+            s.setblocking(False)
+            _SOCKS[fd] = s
+            if os.environ.get("ARM2X86_VERBOSE"):
+                sys.stderr.write("[sock] accept: recovered fd %d" % fd + chr(10)); sys.stderr.flush()
+        except Exception as ex:
+            if os.environ.get("ARM2X86_VERBOSE"):
+                globals().setdefault("_ACCEPT_LOG", 0)
+                if globals()["_ACCEPT_LOG"] < 3:
+                    sys.stderr.write("[sock] accept: no socket for fd %d: %s" % (fd, ex) + chr(10)); sys.stderr.flush()
+                    globals()["_ACCEPT_LOG"] += 1
+            # Fallback: guest may have lost the listen fd number (accept on 0)
+            if _LISTEN_FDS:
+                fd2 = next(iter(_LISTEN_FDS))
+                s = _SOCKS.get(fd2)
+                if s is not None:
+                    if os.environ.get("ARM2X86_VERBOSE"):
+                        globals().setdefault("_ACCEPT_LOG", 0)
+                    if globals()["_ACCEPT_LOG"] < 3:
+                        sys.stderr.write("[sock] accept: fd %d invalid, using listen fd %d" % (fd, fd2) + chr(10)); sys.stderr.flush()
+                        globals()["_ACCEPT_LOG"] += 1
+                else:
+                    return _fail(e, EBADF, 0xffffffff)
+            else:
+                return _fail(e, EBADF, 0xffffffff)
+            if not s:
+                return _fail(e, EBADF, 0xffffffff)
+    try:
+        conn, _addr = s.accept()
+        conn.setblocking(False)
+        cfd = conn.fileno()
+        _SOCKS[cfd] = conn
+        return cfd
+    except BlockingIOError:
+        return _fail(e, EAGAIN, 0xffffffff)
+    except OSError as ex:
+        err = _derr(ex)
+        if err in (EAGAIN, 35, 11):
+            return _fail(e, EAGAIN, 0xffffffff)
+        return _fail(e, err, 0xffffffff)
+
+
 @fn("send", "sendto")
 def _send(e):
     s = _sock(e.arg(0))
@@ -1291,3 +1573,198 @@ def _close_nc(e): return _close(e)
 def _read_nc(e): return FUNCS["_read"](e)
 @fn("write$NOCANCEL")
 def _write_nc(e): return FUNCS["_write"](e)
+
+
+# ---- post-fork / process identity (single-process) ----------------------------
+@fn("sigaltstack")
+def _sigaltstack(e):
+    # Report success; we do not switch stacks under Unicorn.
+    return 0
+
+@fn("setsid")
+def _setsid(e):
+    # Become session leader: return a fake positive pgid.
+    return 1
+
+@fn("setpgid", "setpgrp")
+def _setpgid(e):
+    return 0
+
+@fn("getppid")
+def _getppid(e):
+    return 1
+
+@fn("getpgrp", "getsid")
+def _getpgrp(e):
+    return 1
+
+@fn("daemon")
+def _daemon(e):
+    # Already "backgrounded" in the emulator.
+    return 0
+
+@fn("isatty")
+def _isatty(e):
+    fd = e.arg(0) & 0xffff
+    return 1 if fd in (0, 1, 2) else 0
+
+@fn("fork", "vfork", "forkpty")
+def _fork(e):
+    # Default: fail fork so the app stays single-process.
+    # ARM2X86_FORK_CHILD=1 -> 0; ARM2X86_FORK_PARENT=1 -> 2
+    if os.environ.get("ARM2X86_FORK_CHILD"):
+        if os.environ.get("ARM2X86_VERBOSE"):
+            sys.stderr.write("[proc] fork -> 0 (child)"); sys.stderr.flush()
+        return 0
+    if os.environ.get("ARM2X86_FORK_PARENT"):
+        if os.environ.get("ARM2X86_VERBOSE"):
+            sys.stderr.write("[proc] fork -> 2 (parent)"); sys.stderr.flush()
+        return 2
+    if os.environ.get("ARM2X86_VERBOSE"):
+        sys.stderr.write("[proc] fork -> -1 EAGAIN (single-process)"); sys.stderr.flush()
+    return _fail(e, EAGAIN, 0xffffffff)
+
+@fn("getsockname")
+def _getsockname(e):
+    s = _sock(e.arg(0))
+    if not s: return _fail(e, EBADF, 0xffffffff)
+    addr_p, len_p = e.arg(1), e.arg(2)
+    try:
+        peer = s.getsockname()
+    except OSError as ex:
+        return _fail(e, _derr(ex), 0xffffffff)
+    if isinstance(peer, str):
+        pathb = peer.encode("utf-8", "surrogateescape")[:104]
+        raw = bytes([2 + len(pathb), 1]) + pathb + b"\0"
+        raw = raw.ljust(106, b"\0")
+    elif isinstance(peer, tuple) and len(peer) >= 2:
+        ip, port = peer[0], peer[1]
+        raw = struct.pack("<H", 2) + struct.pack("!H", int(port)) + socket.inet_aton(ip) + b"\0" * 8
+    else:
+        raw = b"\0" * 16
+    if len_p:
+        try:
+            cap = int.from_bytes(e.read(len_p, 4), "little") or len(raw)
+        except Exception:
+            cap = len(raw)
+        e.write(len_p, struct.pack("<I", min(cap, len(raw))))
+        raw = raw[:cap]
+    if addr_p:
+        e.write(addr_p, raw)
+    return 0
+
+@fn("getpeername")
+def _getpeername(e):
+    return _getsockname(e)
+
+@fn("CCRandomGenerateBytes")
+def _cc_rand(e):
+    import os as _os
+    n = e.arg(1) & 0xffffffff
+    if n and e.arg(0):
+        e.write(e.arg(0), _os.urandom(n))
+    return 0
+
+
+@fn("waitpid", "wait4")
+def _waitpid(e):
+    # Fake children from posix_spawn always look already exited.
+    pid = e.arg(0) & 0xffffffff
+    status = e.arg(1)
+    if status:
+        try:
+            e.write(status, (0).to_bytes(4, "little"))  # WEXITSTATUS 0
+        except Exception:
+            pass
+    if pid in (0, 0xffffffff):
+        return os.getpid() & 0x7fffffff
+    return pid if pid else _fail(e, 10, 0xffffffff)
+
+@fn("posix_spawn", "posix_spawnp")
+def _pspawn(e):
+    # Fake success — crash-handler connect is faked in connect().
+    pid_ptr = e.arg(0)
+    if pid_ptr:
+        try:
+            e.write(pid_ptr, (os.getpid() & 0xffffffff).to_bytes(4, "little") + bytes(4))
+        except Exception:
+            pass
+    if os.environ.get("ARM2X86_VERBOSE"):
+        sys.stderr.write("[proc] posix_spawn* -> 0 (fake child)")
+    return 0
+
+@fn("posix_spawnattr_init", "posix_spawnattr_destroy", "posix_spawnattr_setflags",
+    "posix_spawnattr_setsigdefault", "posix_spawnattr_setsigmask",
+    "posix_spawnattr_setpgroup", "posix_spawnattr_setexceptionports_np",
+    "posix_spawn_file_actions_init", "posix_spawn_file_actions_destroy",
+    "posix_spawn_file_actions_adddup2", "posix_spawn_file_actions_addchdir_np",
+    "posix_spawn_file_actions_addinherit_np")
+def _pspawn_ok(e):
+    return 0
+
+@fn("writev")
+def _writev(e):
+    fd, iov, iovcnt = e.arg(0), e.arg(1), e.arg(2) & 0xffffffff
+    total = 0
+    try:
+        for i in range(min(iovcnt, 64)):
+            base = int.from_bytes(e.read(iov + i * 16, 8), "little")
+            length = int.from_bytes(e.read(iov + i * 16 + 8, 8), "little")
+            if not length: continue
+            data = e.read(base, min(length, 1 << 20))
+            # crash-handler / fake sockets: discard
+            if fd in getattr(e, "_SOCKS", {}) or fd > 2:
+                try:
+                    s = e._SOCKS.get(fd)
+                    if s: s.send(data)
+                except Exception:
+                    pass
+            else:
+                try: os.write(fd, data)
+                except Exception: pass
+            total += len(data)
+        return total
+    except Exception:
+        return _fail(e, 9)
+@fn("readv")
+def _readv(e):
+    fd, iov, iovcnt = e.arg(0), e.arg(1), e.arg(2) & 0xffffffff
+    total = 0
+    try:
+        for i in range(min(iovcnt, 64)):
+            base = int.from_bytes(e.read(iov + i * 16, 8), "little")
+            length = int.from_bytes(e.read(iov + i * 16 + 8, 8), "little")
+            if not length: continue
+            # no data on fake crash-handler socket
+            chunk = b"\x00" * 0
+            try:
+                s = getattr(e, "_SOCKS", {}).get(fd)
+                if s:
+                    s.settimeout(0.0)
+                    chunk = s.recv(length)
+            except Exception:
+                chunk = b""
+            if chunk:
+                e.write(base, chunk)
+                total += len(chunk)
+            else:
+                break
+        return total if total else _fail(e, 35)  # EAGAIN
+    except Exception:
+        return _fail(e, 9)
+
+
+@fn("abort")
+def _abort(e):
+    # Skip GPUI profiler panics so startup can continue under partial emulation.
+    from unicorn.arm64_const import UC_ARM64_REG_LR, UC_ARM64_REG_PC
+    lr = e.uc.reg_read(UC_ARM64_REG_LR)
+    n = getattr(e, "_abort_skips", 0)
+    if n < 32:
+        e._abort_skips = n + 1
+        sys.stderr.write(("[arm2x86] abort skipped #%d (lr=%#x) — continuing" % (n + 1, lr)) + chr(10))
+        e.uc.reg_write(UC_ARM64_REG_PC, lr)
+        return None
+    sys.stderr.write("[arm2x86] abort limit reached, exiting" + chr(10))
+    e.exit(134)
+    return None

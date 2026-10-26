@@ -1384,10 +1384,202 @@ fn("objc_opt_class")(_opt_class)
 def _cgim(e): return 0
 @fn("method_getImplementation", "method_getName")
 def _mgi(e): return 0
-@fn("objc_allocateClassPair", "objc_registerClassPair", "class_addMethod", "class_addIvar", "class_addProtocol")
-def _dynclass(e):
-    sys.stderr.write("[objc] guest class_add*/allocateClassPair is not wired to the host runtime\n")
+# ---- dynamic class registration (GPUI / ClassBuilder) ----------------------------
+_DYN = {}          # host Class -> {name, methods, ivars}
+_DYN_BY_NAME = {}
+_IMP_TRAMP = {}    # (host_class, selname) -> CFUNCTYPE trampoline kept alive
+
+def _guest_imp_trampoline(e_ref, guest_imp, selname, arity=2):
+    """Host IMP that queues the guest IMP onto PENDING for the emulator."""
+    # arity includes self, _cmd
+    if arity <= 2:
+        proto = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+        def cb(self_, sel, _imp=guest_imp, _sn=selname):
+            with _LOCK:
+                PENDING.append((_imp, [self_ or 0, sel or 0]))
+            return None
+    elif arity == 3:
+        proto = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+        def cb(self_, sel, a2, _imp=guest_imp, _sn=selname):
+            with _LOCK:
+                PENDING.append((_imp, [self_ or 0, sel or 0, a2 or 0]))
+            return None
+    else:
+        proto = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+        def cb(self_, sel, a2, a3, _imp=guest_imp, _sn=selname):
+            with _LOCK:
+                PENDING.append((_imp, [self_ or 0, sel or 0, a2 or 0, a3 or 0]))
+            return None
+    t = proto(cb)
+    _KEEP.append(t)
+    return t
+
+@fn("objc_allocateClassPair")
+def _objc_allocateClassPair(e):
+    if not DARWIN:
+        return 0
+    superclass = e.arg(0)
+    name_ptr = e.arg(1)
+    extra = e.arg(2)
+    name_str = e.cstr(name_ptr) if name_ptr else "Anon"
+    o = host()["objc"]
+    o.objc_allocateClassPair.restype = c_void_p
+    o.objc_allocateClassPair.argtypes = [c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+    host_class = o.objc_allocateClassPair(superclass, name_str.encode("utf-8"), extra)
+    if not host_class:
+        return 0
+    _DYN[host_class] = {"name": name_str, "methods": {}, "ivars": {}}
+    _DYN_BY_NAME[name_str] = host_class
+    if os.environ.get("ARM2X86_VERBOSE"):
+        sys.stderr.write("[objc] objc_allocateClassPair(%r, super=%#x) -> %#x\n" % (name_str, superclass, host_class))
+    return host_class & M64
+
+@fn("class_addIvar")
+def _class_addIvar(e):
+    if not DARWIN:
+        return 0
+    cls = e.arg(0)
+    name = e.cstr(e.arg(1)) if e.arg(1) else ""
+    size = e.arg(2) & 0xffffffff
+    align = e.arg(3) & 0xff
+    types = e.cstr(e.arg(4)) if e.arg(4) else "@"
+    o = host()["objc"]
+    o.class_addIvar.restype = ctypes.c_bool
+    o.class_addIvar.argtypes = [c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint8, ctypes.c_char_p]
+    ok = o.class_addIvar(cls, name.encode("utf-8"), size, align, types.encode("utf-8"))
+    if cls in _DYN:
+        _DYN[cls]["ivars"][name] = {"size": size, "align": align, "types": types}
+    if os.environ.get("ARM2X86_VERBOSE"):
+        sys.stderr.write("[objc] class_addIvar(%#x, %r, size=%d, align=%d) -> %s\n" % (cls, name, size, align, ok))
+    return 1 if ok else 0
+
+@fn("class_addMethod")
+def _class_addMethod(e):
+    if not DARWIN:
+        return 0
+    cls = e.arg(0)
+    sel = e.arg(1)
+    imp = e.arg(2)
+    enc = e.cstr(e.arg(3)) if e.arg(3) else "v@:"
+    o = host()["objc"]
+    # resolve sel name
+    o.sel_getName.restype = ctypes.c_char_p
+    o.sel_getName.argtypes = [c_void_p]
+    raw = o.sel_getName(sel) or b"?"
+    selname = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    # count colons for arity heuristic
+    arity = 2 + selname.count(":")
+    tramp = _guest_imp_trampoline(e, imp, selname, arity=min(arity, 4))
+    o.class_addMethod.restype = ctypes.c_bool
+    o.class_addMethod.argtypes = [c_void_p, c_void_p, c_void_p, ctypes.c_char_p]
+    ok = o.class_addMethod(cls, sel, ctypes.cast(tramp, c_void_p), enc.encode("utf-8"))
+    if cls in _DYN:
+        _DYN[cls]["methods"][selname] = imp
+    if os.environ.get("ARM2X86_VERBOSE"):
+        sys.stderr.write("[objc] class_addMethod(%#x, %r, imp=%#x, enc=%r) -> %s\n" % (cls, selname, imp, enc.encode() if isinstance(enc, str) else enc, ok))
+    return 1 if ok else 0
+
+@fn("objc_registerClassPair")
+def _objc_registerClassPair(e):
+    if not DARWIN:
+        return None
+    cls = e.arg(0)
+    o = host()["objc"]
+    o.objc_registerClassPair.restype = None
+    o.objc_registerClassPair.argtypes = [c_void_p]
+    o.objc_registerClassPair(cls)
+    name = _DYN.get(cls, {}).get("name", "?")
+    if os.environ.get("ARM2X86_VERBOSE"):
+        sys.stderr.write("[objc] objc_registerClassPair(%#x %r)\n" % (cls, name))
+    return None
+
+@fn("class_addProtocol")
+def _class_addProtocol(e):
+    if not DARWIN:
+        return 0
+    o = host()["objc"]
+    try:
+        o.class_addProtocol.restype = ctypes.c_bool
+        o.class_addProtocol.argtypes = [c_void_p, c_void_p]
+        return 1 if o.class_addProtocol(e.arg(0), e.arg(1)) else 0
+    except Exception:
+        return 0
+
+@fn("class_getInstanceVariable")
+def _class_getInstanceVariable(e):
+    if not DARWIN:
+        return 0
+    cls = e.arg(0)
+    name = e.cstr(e.arg(1)) if e.arg(1) else ""
+    if not cls or not name:
+        return 0
+    o = host()["objc"]
+    o.class_getInstanceVariable.restype = c_void_p
+    o.class_getInstanceVariable.argtypes = [c_void_p, ctypes.c_char_p]
+    # Walk superclass chain on host
+    cur = cls
+    o.class_getSuperclass.restype = c_void_p
+    o.class_getSuperclass.argtypes = [c_void_p]
+    for _ in range(64):
+        if not cur:
+            break
+        iv = o.class_getInstanceVariable(cur, name.encode("utf-8"))
+        if iv:
+            return iv & M64
+        cur = o.class_getSuperclass(cur)
     return 0
+
+@fn("class_getSuperclass")
+def _class_getSuperclass(e):
+    if not DARWIN:
+        return 0
+    o = host()["objc"]
+    o.class_getSuperclass.restype = c_void_p
+    o.class_getSuperclass.argtypes = [c_void_p]
+    return (o.class_getSuperclass(e.arg(0)) or 0) & M64
+
+@fn("class_isMetaClass")
+def _class_isMetaClass(e):
+    if not DARWIN:
+        return 0
+    o = host()["objc"]
+    o.class_isMetaClass.restype = ctypes.c_bool
+    o.class_isMetaClass.argtypes = [c_void_p]
+    return 1 if o.class_isMetaClass(e.arg(0)) else 0
+
+@fn("ivar_getOffset")
+def _ivar_getOffset(e):
+    if not DARWIN:
+        return 0
+    o = host()["objc"]
+    o.ivar_getOffset.restype = ctypes.c_long
+    o.ivar_getOffset.argtypes = [c_void_p]
+    return o.ivar_getOffset(e.arg(0)) & M64
+
+@fn("ivar_getName")
+def _ivar_getName(e):
+    if not DARWIN:
+        return 0
+    o = host()["objc"]
+    o.ivar_getName.restype = ctypes.c_char_p
+    o.ivar_getName.argtypes = [c_void_p]
+    n = o.ivar_getName(e.arg(0))
+    if not n:
+        return 0
+    return e.alloc_cstr(n.decode("utf-8", "replace") if isinstance(n, bytes) else str(n))
+
+@fn("ivar_getTypeEncoding")
+def _ivar_getTypeEncoding(e):
+    if not DARWIN:
+        return 0
+    o = host()["objc"]
+    o.ivar_getTypeEncoding.restype = ctypes.c_char_p
+    o.ivar_getTypeEncoding.argtypes = [c_void_p]
+    n = o.ivar_getTypeEncoding(e.arg(0))
+    if not n:
+        return 0
+    return e.alloc_cstr(n.decode("utf-8", "replace") if isinstance(n, bytes) else str(n))
+
 @fn("objc_retain", "objc_retainAutoreleasedReturnValue", "objc_retainAutorelease")
 def _ret(e):
     v = e.arg(0)
@@ -1428,18 +1620,55 @@ def _dev(e):
 
 # dispatch: best effort. Blocks run on the guest at the next bridged call; semaphores never block.
 @fn("dispatch_semaphore_create")
-def _dsc(e): return e.malloc(8)
+def _dsc(e):
+    p = e.malloc(16)
+    e.write(p, (e.arg(0) & M64).to_bytes(8, "little"))
+    return p
 @fn("dispatch_semaphore_signal")
-def _dss(e): return 0
+def _dss(e):
+    p = e.arg(0)
+    if p:
+        try:
+            v = int.from_bytes(e.read(p, 8), "little")
+            e.write(p, (v + 1).to_bytes(8, "little"))
+        except Exception:
+            pass
+    return 0
 @fn("dispatch_semaphore_wait")
 def _dsw(e):
+    # Process any pending host->guest callbacks, then succeed (never hard-block the emu)
     p = take_pending()
-    if p: e.begin_callbacks(p, 0)
-    else: return 0
+    if p:
+        e.begin_callbacks(p, 0)
+        return None  # begin_callbacks takes over
+    # non-blocking: always "got" the semaphore so the guest progresses
+    return 0
 @fn("dispatch_async", "dispatch_sync")
 def _da(e):
     blk = e.arg(1)
-    if blk: e.begin_callbacks([(struct.unpack("<Q", bytes(e.read(blk + 16, 8)))[0], [blk])], 0)
+    if blk:
+        try:
+            inv = struct.unpack("<Q", bytes(e.read(blk + 16, 8)))[0]
+            e.begin_callbacks([(inv, [blk])], 0)
+        except Exception:
+            pass
+    return None
+@fn("dispatch_async_f")
+def _daf(e):
+    # void dispatch_async_f(dispatch_queue_t queue, void *context, dispatch_function_t work)
+    # work is a C function pointer: void work(void *context)
+    ctx = e.arg(1)
+    work = e.arg(2)
+    if work:
+        e.begin_callbacks([(work, [ctx])], 0)
+    return None
+@fn("dispatch_sync_f")
+def _dsf(e):
+    ctx = e.arg(1)
+    work = e.arg(2)
+    if work:
+        e.begin_callbacks([(work, [ctx])], 0)
+    return None
 
 # NSLog(fmt, ...): supports %@ via -description
 _NSFMT = re.compile(r"%@")

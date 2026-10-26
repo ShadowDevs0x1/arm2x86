@@ -583,7 +583,13 @@ class Emu:
         self.uc.reg_write(UC_ARM64_REG_FP, fp)
         self.uc.reg_write(UC_ARM64_REG_PC, lr)
         self.uc.reg_write(UC_ARM64_REG_X0, x0_caller)
-        self.threads[tid] = {"state": "run", "ctx": ctx, "wait": None}
+        # GPUI/Rust thread_local profiler breaks when multiple guest threads
+        # share one host OS thread. Keep only the main guest thread runnable
+        # unless ARM2X86_MULTI_THREAD=1.
+        if os.environ.get("ARM2X86_MULTI_THREAD"):
+            self.threads[tid] = {"state": "run", "ctx": ctx, "wait": None}
+        else:
+            self.threads[tid] = {"state": "wait", "ctx": ctx, "wait": ("parked", None)}
         if not self._sched:
             self.uc.hook_add(UC_HOOK_BLOCK, self._on_block)
             self._sched = True

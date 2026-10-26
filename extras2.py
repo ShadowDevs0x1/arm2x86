@@ -137,8 +137,52 @@ fn("CGDisplayModeCopyPixelEncoding")(_cgmode("CGDisplayModeCopyPixelEncoding", c
 fn("CGDisplayModeGetRefreshRate")(_cgmode("CGDisplayModeGetRefreshRate", ctypes.c_double, 0))
 fn("CGDisplayIOServicePort")(lambda e: 0)
 fn("IODisplayCreateInfoDictionary")(lambda e: 0)
-fn("TISCopyCurrentKeyboardLayoutInputSource")(lambda e: 0)
-fn("TISGetInputSourceProperty")(lambda e: 0)
+# Text Input Source (keyboard layout) — call host Carbon if present, else CFString stubs.
+_TIS_SRC = None  # host TISInputSourceRef
+_TIS_PROPS = {}
+
+def _tis_host():
+    global _TIS_SRC
+    if _TIS_SRC is not None:
+        return _TIS_SRC
+    try:
+        ht = ctypes.CDLL("/System/Library/Frameworks/Carbon.framework/Carbon")
+        ht.TISCopyCurrentKeyboardLayoutInputSource.restype = ctypes.c_void_p
+        ht.TISCopyCurrentKeyboardLayoutInputSource.argtypes = []
+        _TIS_SRC = ht.TISCopyCurrentKeyboardLayoutInputSource() or 1
+        return _TIS_SRC
+    except Exception:
+        _TIS_SRC = 1  # non-null fake token
+        return _TIS_SRC
+
+def _tis_copy(e):
+    return _tis_host() & 0xffffffffffffffff
+
+def _tis_prop(e):
+    # TISGetInputSourceProperty(source, propertyKey) -> CFTypeRef
+    key = e.arg(1)
+    # Resolve key: may be CFString host pointer or guest-bound constant address
+    name = None
+    try:
+        # try reading as C string if it looks like our bound constant
+        from cocoa import lib as _cflib  # may fail
+    except Exception:
+        _cflib = None
+    # Always return a CFString for common properties so strlen/CFStringGet* don't see NULL
+    try:
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        # kTISPropertyInputSourceID etc. — return a stable ASCII id
+        s = b"com.apple.keylayout.US"
+        p = cf.CFStringCreateWithCString(None, s, 0x08000100)  # kCFStringEncodingUTF8
+        return (p or 1) & 0xffffffffffffffff
+    except Exception:
+        return 1
+
+fn("TISCopyCurrentKeyboardLayoutInputSource")(_tis_copy)
+fn("TISCopyCurrentKeyboardInputSource")(_tis_copy)
+fn("TISGetInputSourceProperty")(_tis_prop)
 def _iopm(e, idx):
     if e.arg(idx): e.write(e.arg(idx), struct.pack("<I", 1))
     return 0
@@ -379,6 +423,52 @@ def _tlv_per_thread(e):
         blk = e.malloc(len(_TLV["tmpl"]) + 64); e.write(blk, _TLV["tmpl"]); _TLV["blk"][tid] = blk
     return blk + int.from_bytes(e.read(e.arg(0) + 16, 8), "little")
 FUNCS["__tlv_bootstrap"] = _tlv_per_thread
+
+
+# ---- libsystem blocks (Rust block2 / objc blocks) --------------------------------
+_BLOCK_RETAIN = {}  # guest_ptr -> host_ptr or count
+
+@fn("Block_copy", "_Block_copy")
+def _block_copy(e):
+    p = e.arg(0)
+    if not p:
+        return 0
+    # Prefer host _Block_copy when pointer is a real host block
+    try:
+        lib = ctypes.CDLL(None)
+        lib._Block_copy.restype = ctypes.c_void_p
+        lib._Block_copy.argtypes = [ctypes.c_void_p]
+        # Only call host if p looks like a host pointer (not guest image/heap)
+        if not (0x100000000 <= p < 0x600000000 or p >= 0x7f0000000000):
+            r = lib._Block_copy(p)
+            if r:
+                return r & 0xffffffffffffffff
+    except Exception:
+        pass
+    # Guest block: bump a retain count and return same pointer so RcBlock sees non-null
+    _BLOCK_RETAIN[p] = _BLOCK_RETAIN.get(p, 0) + 1
+    return p
+
+@fn("Block_release", "_Block_release")
+def _block_release(e):
+    p = e.arg(0)
+    if not p:
+        return None
+    try:
+        lib = ctypes.CDLL(None)
+        lib._Block_release.restype = None
+        lib._Block_release.argtypes = [ctypes.c_void_p]
+        if not (0x100000000 <= p < 0x600000000 or p >= 0x7f0000000000):
+            lib._Block_release(p)
+            return None
+    except Exception:
+        pass
+    c = _BLOCK_RETAIN.get(p, 0)
+    if c <= 1:
+        _BLOCK_RETAIN.pop(p, None)
+    else:
+        _BLOCK_RETAIN[p] = c - 1
+    return None
 
 # ---- generic: guest CFString constants passed to host-bound CoreFoundation/CoreGraphics wrappers become real NSStrings
 def _wrap_bridge(f):
